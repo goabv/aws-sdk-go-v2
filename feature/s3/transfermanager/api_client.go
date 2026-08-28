@@ -20,6 +20,14 @@ const defaultPartBodyMaxRetries = 3
 
 const defaultGetBufferSize = 1024 * 1024 * 50
 
+// defaultDirectIOThreshold is the default DownloadFile object-size threshold in
+// bytes above which the destination file is written with O_DIRECT.
+const defaultDirectIOThreshold = 100 * 1024 * 1024
+
+// defaultWriteChunkSizeBytes is the default fixed size in bytes of each write
+// DownloadFile issues to the destination file.
+const defaultWriteChunkSizeBytes = 1024 * 1024 * 8
+
 // Client provides the API client to make operations call for Amazon Simple
 // Storage Service's Transfer Manager
 // It is safe to call Client methods concurrently across goroutines.
@@ -45,6 +53,8 @@ func New(s3Client S3APIClient, optFns ...func(*Options)) *Client {
 	resolvePartBodyMaxRetries(&opts)
 	resolveGetBufferSize(&opts)
 	resolveMaxUploadParts(&opts)
+	resolveDirectIOThreshold(&opts)
+	resolveWriteChunkSizeBytes(&opts)
 
 	return &Client{
 		options: opts,
