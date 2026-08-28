@@ -168,6 +168,8 @@ func (c *Client) DownloadFile(ctx context.Context, input *DownloadFileInput, opt
 	resolvePartBodyMaxRetries(&options)
 	resolveDirectIOThreshold(&options)
 	resolveWriteChunkSizeBytes(&options)
+	resolveWriteFlushWorkers(&options)
+	resolveWriteFlushQueueDepth(&options)
 
 	size, err := c.downloadFileObjectSize(ctx, input, &options)
 	if err != nil {

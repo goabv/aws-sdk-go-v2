@@ -88,6 +88,25 @@ type Options struct {
 	// up to the block size. Ignored by DownloadObject.
 	WriteChunkSizeBytes int64
 
+	// WriteFlushWorkers is the number of write-behind flush goroutines DownloadFile
+	// runs per destination file. Completed chunks are handed to this pool so the
+	// download part-workers are not blocked on disk I/O; the count also caps how many
+	// writes hit the device at once. If zero, defaultWriteFlushWorkers (16) is used.
+	// Ignored by DownloadObject.
+	WriteFlushWorkers int
+
+	// WriteFlushQueueDepth is the depth of the bounded queue feeding the flush
+	// workers. It bounds how many completed chunks may wait for the disk (and thus
+	// the write-behind memory headroom) and provides backpressure when the disk falls
+	// behind. If zero, defaultWriteFlushQueueDepth (64) is used. Ignored by
+	// DownloadObject.
+	WriteFlushQueueDepth int
+
+	// DisableWriteBufferPool turns off recycling of the O_DIRECT region buffers in
+	// DownloadFile (each region is then freshly allocated and left to the GC). Use it
+	// to A/B pooled vs raw-malloc region buffers. Ignored by DownloadObject.
+	DisableWriteBufferPool bool
+
 	// Registry of single object progress listener hooks.
 	//
 	// It is safe to modify the registry in per-operation functional options,
@@ -175,6 +194,18 @@ func resolveDirectIOThreshold(o *Options) {
 func resolveWriteChunkSizeBytes(o *Options) {
 	if o.WriteChunkSizeBytes == 0 {
 		o.WriteChunkSizeBytes = defaultWriteChunkSizeBytes
+	}
+}
+
+func resolveWriteFlushWorkers(o *Options) {
+	if o.WriteFlushWorkers == 0 {
+		o.WriteFlushWorkers = defaultWriteFlushWorkers
+	}
+}
+
+func resolveWriteFlushQueueDepth(o *Options) {
+	if o.WriteFlushQueueDepth == 0 {
+		o.WriteFlushQueueDepth = defaultWriteFlushQueueDepth
 	}
 }
 

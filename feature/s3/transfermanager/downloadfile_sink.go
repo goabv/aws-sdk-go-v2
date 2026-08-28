@@ -11,8 +11,9 @@ import (
 
 // fileSink is the destination DownloadFile writes an object into. The downloader
 // streams part/range bodies into WriteAt (in ~16 KiB pieces from io.Copy); the
-// sink coalesces them into fixed-size chunks before writing to disk, and Close
-// flushes any partial trailing chunk and finalizes the file.
+// sink coalesces them into fixed-size chunks and hands each completed chunk to a
+// pool of flush workers (write-behind), so the download part-workers are not
+// blocked on disk I/O. Close flushes any partial trailing chunk and finalizes.
 type fileSink interface {
 	io.WriterAt
 	io.Closer
@@ -28,7 +29,7 @@ type chunkSinkBackend interface {
 	// writeRegion writes n bytes of buf to the file at absolute offset off. n may be
 	// less than chunkSize for the trailing region of the object.
 	writeRegion(buf []byte, n int64, off int64) error
-	// freeBuf releases a region buffer after its data has been written.
+	// freeBuf releases (or recycles) a region buffer after its data has been written.
 	freeBuf(buf []byte)
 	// finalize completes the file given the total object size (highest offset+len
 	// written). Backends that pad writes (O_DIRECT) truncate back to size here.
@@ -50,26 +51,91 @@ type chunkShard struct {
 	regions map[int64]*chunkRegion
 }
 
+// flushJob is a completed (or trailing partial) region handed to a flush worker to
+// be written to the file at off; n is the number of valid bytes in buf.
+type flushJob struct {
+	buf []byte
+	n   int64
+	off int64
+}
+
 // chunkedWriterAt is an io.WriterAt that coalesces arbitrarily-sized, possibly
-// out-of-order writes into fixed-size (chunkSize) regions and hands each completed
-// region to a backend. Incoming writes are keyed to a region by offset/chunkSize;
-// the region map is sharded so concurrent writers to different regions do not
-// contend. A region is flushed as soon as it fills (chunkSize bytes received); any
-// region still partial at Close is flushed then. This gives a fixed disk-write size
+// out-of-order writes into fixed-size (chunkSize) regions and writes them behind a
+// bounded queue drained by a pool of flush workers, so the download part-workers
+// never block on the disk write (network receive is decoupled from disk write).
+//
+// Incoming writes are keyed to a region by offset/chunkSize; the region map is
+// sharded so concurrent writers to different regions do not contend. A region is
+// enqueued for flushing as soon as it fills (chunkSize bytes received); the queue
+// bounds how many filled regions may wait (backpressure if the disk falls behind),
+// and the worker count caps how many writes hit the device at once. Any region
+// still partial at Close is enqueued then. This gives a fixed disk-write size
 // regardless of the download range/part size.
 type chunkedWriterAt struct {
 	backend   chunkSinkBackend
 	chunkSize int64
 	maxEnd    atomic.Int64
-	shards    [chunkShards]chunkShard
+
+	jobs   chan flushJob
+	wg     sync.WaitGroup
+	failed atomic.Bool
+	errMu  sync.Mutex
+	err    error
+
+	shards [chunkShards]chunkShard
 }
 
-func newChunkedWriterAt(backend chunkSinkBackend, chunkSize int64) *chunkedWriterAt {
-	w := &chunkedWriterAt{backend: backend, chunkSize: chunkSize}
+func newChunkedWriterAt(backend chunkSinkBackend, chunkSize int64, flushWorkers, queueDepth int) *chunkedWriterAt {
+	if flushWorkers <= 0 {
+		flushWorkers = defaultWriteFlushWorkers
+	}
+	if queueDepth <= 0 {
+		queueDepth = defaultWriteFlushQueueDepth
+	}
+	w := &chunkedWriterAt{
+		backend:   backend,
+		chunkSize: chunkSize,
+		jobs:      make(chan flushJob, queueDepth),
+	}
 	for i := range w.shards {
 		w.shards[i].regions = make(map[int64]*chunkRegion)
 	}
+	w.wg.Add(flushWorkers)
+	for i := 0; i < flushWorkers; i++ {
+		go w.flushLoop()
+	}
 	return w
+}
+
+// flushLoop drains completed regions and writes them to the backend. Up to
+// flushWorkers of these run concurrently, so at most that many writes hit the
+// device at once. A worker keeps draining after an error (so senders never block)
+// but skips the write once a prior write has failed.
+func (w *chunkedWriterAt) flushLoop() {
+	defer w.wg.Done()
+	for job := range w.jobs {
+		if !w.failed.Load() {
+			if err := w.backend.writeRegion(job.buf, job.n, job.off); err != nil {
+				w.setErr(err)
+			}
+		}
+		w.backend.freeBuf(job.buf)
+	}
+}
+
+func (w *chunkedWriterAt) setErr(err error) {
+	w.errMu.Lock()
+	if w.err == nil {
+		w.err = err
+	}
+	w.errMu.Unlock()
+	w.failed.Store(true)
+}
+
+func (w *chunkedWriterAt) loadErr() error {
+	w.errMu.Lock()
+	defer w.errMu.Unlock()
+	return w.err
 }
 
 func (w *chunkedWriterAt) WriteAt(p []byte, off int64) (int, error) {
@@ -105,13 +171,13 @@ func (w *chunkedWriterAt) WriteAt(p []byte, off int64) (int, error) {
 		w.bumpMaxEnd(off + take)
 
 		if full != nil {
-			// The region is complete; no later WriteAt targets it, so this goroutine
-			// solely owns the buffer and can write it outside the shard lock.
-			if err := w.backend.writeRegion(full, w.chunkSize, regionStart); err != nil {
-				w.backend.freeBuf(full)
-				return total - len(p), err
+			// Region complete: hand it to the flush pool. The send blocks when the
+			// queue is full (backpressure onto the download) but never on this
+			// goroutine's own disk write.
+			w.jobs <- flushJob{buf: full, n: w.chunkSize, off: regionStart}
+			if w.failed.Load() {
+				return total - len(p), w.loadErr()
 			}
-			w.backend.freeBuf(full)
 		}
 
 		off += take
@@ -132,26 +198,34 @@ func (w *chunkedWriterAt) bumpMaxEnd(end int64) {
 	}
 }
 
-// Close flushes any regions that never filled (the object's trailing chunk) and
-// finalizes the file. It is not safe to call WriteAt concurrently with Close.
+// Close enqueues the trailing partial regions (those that never filled), drains and
+// stops the flush pool, then finalizes the file. It must not be called concurrently
+// with WriteAt — the downloader has finished all part-workers before DownloadFile
+// calls Close.
 func (w *chunkedWriterAt) Close() error {
-	var firstErr error
+	// Collect partial regions, then enqueue them after releasing the shard locks so a
+	// full queue can never deadlock against a worker.
+	var partials []flushJob
 	for i := range w.shards {
 		sh := &w.shards[i]
 		sh.mu.Lock()
 		for ridx, r := range sh.regions {
-			if err := w.backend.writeRegion(r.buf, r.filled, ridx*w.chunkSize); err != nil && firstErr == nil {
-				firstErr = err
-			}
-			w.backend.freeBuf(r.buf)
+			partials = append(partials, flushJob{buf: r.buf, n: r.filled, off: ridx * w.chunkSize})
 			delete(sh.regions, ridx)
 		}
 		sh.mu.Unlock()
 	}
-	if err := w.backend.finalize(w.maxEnd.Load()); err != nil && firstErr == nil {
-		firstErr = err
+	for _, j := range partials {
+		w.jobs <- j
 	}
-	return firstErr
+	close(w.jobs)
+	w.wg.Wait()
+
+	err := w.loadErr()
+	if ferr := w.backend.finalize(w.maxEnd.Load()); ferr != nil && err == nil {
+		err = ferr
+	}
+	return err
 }
 
 // bufferedBackend writes regions through *os.File.WriteAt (page cache). Used for
@@ -175,7 +249,7 @@ func (b *bufferedBackend) finalize(size int64) error {
 	return b.f.Close()
 }
 
-func newBufferedChunkSink(path string, chunkSize int64) (fileSink, error) {
+func newBufferedChunkSink(path string, chunkSize int64, flushWorkers, queueDepth int) (fileSink, error) {
 	if chunkSize <= 0 {
 		chunkSize = defaultWriteChunkSizeBytes
 	}
@@ -183,14 +257,15 @@ func newBufferedChunkSink(path string, chunkSize int64) (fileSink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open %q: %w", path, err)
 	}
-	return newChunkedWriterAt(&bufferedBackend{f: f, chunkSize: chunkSize}, chunkSize), nil
+	return newChunkedWriterAt(&bufferedBackend{f: f, chunkSize: chunkSize}, chunkSize, flushWorkers, queueDepth), nil
 }
 
 // newFileSink chooses the destination writer for DownloadFile. Objects strictly
-// larger than DirectIOThreshold use the O_DIRECT backend when available (Linux)
-// and not disabled; everything else uses the buffered backend. If opening in
-// O_DIRECT fails (e.g. the filesystem does not support it), it falls back to the
-// buffered writer so the download still succeeds.
+// larger than DirectIOThreshold use the O_DIRECT backend when available (Linux) and
+// not disabled; everything else uses the buffered backend. If opening in O_DIRECT
+// fails (e.g. the filesystem does not support it), it falls back to the buffered
+// writer so the download still succeeds. Both backends use the same write-behind
+// flush pool (WriteFlushWorkers / WriteFlushQueueDepth).
 func newFileSink(path string, size int64, o *Options) (fileSink, error) {
 	chunkSize := o.WriteChunkSizeBytes
 	if chunkSize <= 0 {
@@ -200,11 +275,13 @@ func newFileSink(path string, size int64, o *Options) (fileSink, error) {
 	if threshold <= 0 {
 		threshold = defaultDirectIOThreshold
 	}
+	flushWorkers := o.WriteFlushWorkers
+	queueDepth := o.WriteFlushQueueDepth
 	if !o.DisableDirectIO && size > threshold && directIOAvailable() {
-		if s, err := newDirectChunkSink(path, chunkSize); err == nil {
+		if s, err := newDirectChunkSink(path, chunkSize, flushWorkers, queueDepth, !o.DisableWriteBufferPool); err == nil {
 			return s, nil
 		}
 		// O_DIRECT unsupported on this file/filesystem; fall back to buffered.
 	}
-	return newBufferedChunkSink(path, chunkSize)
+	return newBufferedChunkSink(path, chunkSize, flushWorkers, queueDepth)
 }

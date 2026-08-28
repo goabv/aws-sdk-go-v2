@@ -28,6 +28,14 @@ const defaultDirectIOThreshold = 100 * 1024 * 1024
 // DownloadFile issues to the destination file.
 const defaultWriteChunkSizeBytes = 1024 * 1024 * 8
 
+// defaultWriteFlushWorkers is the default number of write-behind flush goroutines
+// DownloadFile runs per destination file.
+const defaultWriteFlushWorkers = 16
+
+// defaultWriteFlushQueueDepth is the default depth of the bounded queue feeding the
+// DownloadFile flush workers.
+const defaultWriteFlushQueueDepth = 64
+
 // Client provides the API client to make operations call for Amazon Simple
 // Storage Service's Transfer Manager
 // It is safe to call Client methods concurrently across goroutines.
@@ -55,6 +63,8 @@ func New(s3Client S3APIClient, optFns ...func(*Options)) *Client {
 	resolveMaxUploadParts(&opts)
 	resolveDirectIOThreshold(&opts)
 	resolveWriteChunkSizeBytes(&opts)
+	resolveWriteFlushWorkers(&opts)
+	resolveWriteFlushQueueDepth(&opts)
 
 	return &Client{
 		options: opts,
