@@ -246,6 +246,13 @@ func (b *bufferedBackend) writeRegion(buf []byte, n int64, off int64) error {
 func (b *bufferedBackend) freeBuf(buf []byte) {}
 
 func (b *bufferedBackend) finalize(size int64) error {
+	// Flush buffered data + metadata to stable media before closing, so the
+	// completed file is durable. Portable (fsync on Unix, FlushFileBuffers on
+	// Windows). One call per file at the end of the transfer.
+	if err := b.f.Sync(); err != nil {
+		b.f.Close()
+		return fmt.Errorf("fsync: %w", err)
+	}
 	return b.f.Close()
 }
 

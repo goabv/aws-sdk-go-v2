@@ -92,6 +92,14 @@ func (b *directBackend) finalize(size int64) error {
 		b.f.Close()
 		return fmt.Errorf("truncate to %d: %w", size, err)
 	}
+	// Flush the device write cache and the (truncated) size metadata to stable
+	// media before returning. O_DIRECT already sent the data blocks to the device,
+	// so this is just a cache flush + metadata commit — one fdatasync per file,
+	// cheap relative to the transfer, and it makes the completed file durable.
+	if err := syscall.Fdatasync(b.fd); err != nil {
+		b.f.Close()
+		return fmt.Errorf("fdatasync: %w", err)
+	}
 	return b.f.Close()
 }
 
