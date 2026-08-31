@@ -285,7 +285,7 @@ func newFileSink(path string, size int64, o *Options) (fileSink, error) {
 	flushWorkers := o.WriteFlushWorkers
 	queueDepth := o.WriteFlushQueueDepth
 	if !o.DisableDirectIO && size > threshold && directIOAvailable() {
-		if s, err := newDirectChunkSink(path, chunkSize, flushWorkers, queueDepth, !o.DisableWriteBufferPool); err == nil {
+		if s, err := newDirectChunkSink(path, chunkSize, flushWorkers, queueDepth); err == nil {
 			return s, nil
 		}
 		// O_DIRECT unsupported on this file/filesystem; fall back to buffered.

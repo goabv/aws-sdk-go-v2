@@ -102,11 +102,6 @@ type Options struct {
 	// DownloadObject.
 	WriteFlushQueueDepth int
 
-	// DisableWriteBufferPool turns off recycling of the O_DIRECT region buffers in
-	// DownloadFile (each region is then freshly allocated and left to the GC). Use it
-	// to A/B pooled vs raw-malloc region buffers. Ignored by DownloadObject.
-	DisableWriteBufferPool bool
-
 	// Registry of single object progress listener hooks.
 	//
 	// It is safe to modify the registry in per-operation functional options,

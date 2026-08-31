@@ -10,6 +10,6 @@ func directIOAvailable() bool { return false }
 
 // newDirectChunkSink is never called on non-Linux platforms (directIOAvailable is
 // false); it exists so the package compiles everywhere.
-func newDirectChunkSink(path string, chunkSize int64, flushWorkers, queueDepth int, poolBuffers bool) (fileSink, error) {
+func newDirectChunkSink(path string, chunkSize int64, flushWorkers, queueDepth int) (fileSink, error) {
 	return nil, fmt.Errorf("O_DIRECT is not supported on this platform")
 }

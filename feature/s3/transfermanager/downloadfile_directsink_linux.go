@@ -20,10 +20,10 @@ func directIOAvailable() bool { return true }
 // newDirectChunkSink opens path with O_DIRECT and returns a chunkedWriterAt that
 // coalesces incoming writes into chunkSize (rounded up to the block size) aligned
 // regions and writes them straight to the device (bypassing the page cache) behind
-// a pool of flushWorkers draining a queueDepth-bounded queue. When poolBuffers is
-// set, aligned region buffers are recycled through a sync.Pool so the sink does not
-// malloc a fresh region for every chunk at line rate.
-func newDirectChunkSink(path string, chunkSize int64, flushWorkers, queueDepth int, poolBuffers bool) (fileSink, error) {
+// a pool of flushWorkers draining a queueDepth-bounded queue. Aligned region buffers
+// are recycled through a sync.Pool so the sink does not malloc a fresh region for
+// every chunk at line rate.
+func newDirectChunkSink(path string, chunkSize int64, flushWorkers, queueDepth int) (fileSink, error) {
 	if chunkSize <= 0 {
 		chunkSize = defaultWriteChunkSizeBytes
 	}
@@ -38,28 +38,21 @@ func newDirectChunkSink(path string, chunkSize int64, flushWorkers, queueDepth i
 		return nil, fmt.Errorf("open O_DIRECT %q: %w", path, err)
 	}
 	b := &directBackend{
-		f:         f,
-		fd:        int(f.Fd()),
-		chunkSize: chunkSize,
-	}
-	if poolBuffers {
-		b.bufPool = newAlignedBufPool(chunkSize, directBlockSize)
+		f:       f,
+		fd:      int(f.Fd()),
+		bufPool: newAlignedBufPool(chunkSize, directBlockSize),
 	}
 	return newChunkedWriterAt(b, chunkSize, flushWorkers, queueDepth), nil
 }
 
 type directBackend struct {
-	f         *os.File
-	fd        int
-	chunkSize int64
-	bufPool   *alignedBufPool // nil when buffer pooling is disabled
+	f       *os.File
+	fd      int
+	bufPool *alignedBufPool
 }
 
 func (b *directBackend) newBuf() []byte {
-	if b.bufPool != nil {
-		return b.bufPool.get()
-	}
-	return alignedBuf(b.chunkSize, directBlockSize)
+	return b.bufPool.get()
 }
 
 func (b *directBackend) writeRegion(buf []byte, n int64, off int64) error {
@@ -80,9 +73,7 @@ func (b *directBackend) writeRegion(buf []byte, n int64, off int64) error {
 }
 
 func (b *directBackend) freeBuf(buf []byte) {
-	if b.bufPool != nil {
-		b.bufPool.put(buf)
-	}
+	b.bufPool.put(buf)
 }
 
 func (b *directBackend) finalize(size int64) error {
@@ -143,13 +134,12 @@ func alignedBuf(size, align int64) []byte {
 // non-moving GC keeps a buffer's backing address stable, so a recycled buffer stays
 // legal for O_DIRECT. sync.Pool lets the runtime reclaim idle buffers under pressure.
 type alignedBufPool struct {
-	pool  sync.Pool
-	size  int64
-	align int64
+	pool sync.Pool
+	size int64
 }
 
 func newAlignedBufPool(size, align int64) *alignedBufPool {
-	p := &alignedBufPool{size: size, align: align}
+	p := &alignedBufPool{size: size}
 	p.pool.New = func() any { return alignedBuf(size, align) }
 	return p
 }
