@@ -176,7 +176,7 @@ func (c *Client) DownloadFile(ctx context.Context, input *DownloadFileInput, opt
 		return nil, err
 	}
 
-	sink, err := newFileSink(input.FilePath, size, &options)
+	sink, err := newDownloadFileSink(input.FilePath, size, &options)
 	if err != nil {
 		return nil, fmt.Errorf("DownloadFile: open destination %q: %w", input.FilePath, err)
 	}

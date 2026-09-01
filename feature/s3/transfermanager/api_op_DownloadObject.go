@@ -948,3 +948,57 @@ func (c *dlChunk) Write(p []byte) (int, error) {
 
 	return n, err
 }
+
+// syncChunkSink is a benchmark-only escape hatch: a destination that owns pooled,
+// chunk-sized buffers and writes them synchronously (no flush queue, no region
+// map). dlChunk.ReadFrom uses this directly when c.w implements it, bypassing
+// WriteAt/chunkedWriterAt entirely for the write path.
+type syncChunkSink interface {
+	// chunkSize returns the fixed buffer size ReadFrom should fill before writing.
+	chunkSize() int64
+	// writeSync takes ownership of buf (length n, no further writes to it by the
+	// caller) and writes it to disk at off before returning.
+	writeSync(buf []byte, n int64, off int64) error
+}
+
+// ReadFrom reads r (one part's response body) directly into a pooled,
+// chunkSize()-sized buffer and writes it synchronously via c.w's syncChunkSink,
+// avoiding both io.Copy's 32KB shuttle buffer and chunkedWriterAt's region-map
+// copy. Falls back to the generic io.Copy(c, r) path (through Write/WriteAt) if
+// c.w does not implement syncChunkSink.
+func (c *dlChunk) ReadFrom(r io.Reader) (int64, error) {
+	sink, ok := c.w.(syncChunkSink)
+	if !ok {
+		return io.Copy(&chunkWriterOnly{c}, r)
+	}
+
+	var total int64
+	for {
+		buf := getSyncChunkBuf()
+		n, err := io.ReadFull(r, buf)
+		if n > 0 {
+			off := c.start + c.cur
+			// writeSync takes ownership of buf (including returning it to the pool),
+			// regardless of success or failure.
+			if werr := sink.writeSync(buf, int64(n), off); werr != nil {
+				return total, werr
+			}
+			c.cur += int64(n)
+			total += int64(n)
+		} else {
+			putSyncChunkBuf(buf)
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
+		}
+	}
+}
+
+// chunkWriterOnly hides ReadFrom so io.Copy takes its generic path (used by the
+// syncChunkSink fallback above, to avoid ReadFrom recursing into itself).
+type chunkWriterOnly struct{ c *dlChunk }
+
+func (w *chunkWriterOnly) Write(p []byte) (int, error) { return w.c.Write(p) }
