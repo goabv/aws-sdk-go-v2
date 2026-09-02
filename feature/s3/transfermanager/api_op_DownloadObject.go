@@ -559,12 +559,12 @@ type downloader struct {
 	written    atomic.Int64
 	etag       string
 
-	// directWriter and directFD are set by initDirectIO when the caller's WriterAt
-	// was a *os.File opted into O_DIRECT. directWriter is nil otherwise; download
-	// uses its presence to decide whether to finalize (truncate + fdatasync) the
-	// destination file before returning.
+	// directWriter and directFile are set by initDirectIO when the caller's
+	// WriterAt was a *os.File opted into O_DIRECT. directWriter is nil otherwise;
+	// download uses its presence to decide whether to finalize (truncate +
+	// fdatasync) the destination file before returning.
 	directWriter *directFileWriterAt
-	directFD     int
+	directFile   *os.File
 
 	err error
 
@@ -575,7 +575,7 @@ func (d *downloader) download(ctx context.Context) (*DownloadObjectOutput, error
 	out, err := d.downloadNoFinalize(ctx)
 
 	if d.directWriter != nil {
-		if ferr := finalizeDirectFile(d.directFD, d.directWriter.finalSize()); ferr != nil && err == nil {
+		if ferr := finalizeDirectFile(d.directFile, d.directWriter.finalSize()); ferr != nil && err == nil {
 			err = fmt.Errorf("finalize O_DIRECT destination: %w", ferr)
 		}
 	}
@@ -758,7 +758,7 @@ func (d *downloader) initDirectIO() error {
 		}
 	}
 
-	w, err := newDirectFileWriterAt(int(f.Fd()))
+	w, err := newDirectFileWriterAt(f)
 	if err != nil {
 		// The filesystem/environment does not support O_DIRECT; fall back to the
 		// caller's plain WriterAt rather than failing the download.
@@ -769,7 +769,7 @@ func (d *downloader) initDirectIO() error {
 
 	d.in.WriterAt = w
 	d.directWriter = w
-	d.directFD = int(f.Fd())
+	d.directFile = f
 	return nil
 }
 

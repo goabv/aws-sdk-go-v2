@@ -4,6 +4,7 @@ package transfermanager
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"syscall"
 )
@@ -28,36 +29,29 @@ func enableDirectIO(fd int) error {
 }
 
 // directFileWriterAt wraps a caller-supplied *os.File that DownloadObject has
-// opted into O_DIRECT on. It writes synchronously via nolock pwrite on the raw fd
-// (bypassing *os.File's internal fdMutex, which otherwise serializes all
-// WriteAt/Write calls on the same *os.File even for disjoint, non-overlapping
-// offsets), padding the tail of each write to the device block size as O_DIRECT
-// requires.
+// opted into O_DIRECT on. It writes via the *os.File's own WriteAt, padding the
+// tail of each write to the device block size as O_DIRECT requires.
 //
 // It implements syncChunkSink so dlChunk.ReadFrom takes its fast path, reading
-// directly into a pooled aligned buffer instead of io.Copy's 32KB shuttle buffer.
-//
-// Correctness depends on every caller offset range being disjoint (true for
-// DownloadObject's part/range workers, which own non-overlapping byte ranges) —
-// this type does no locking of its own between concurrent WriteAt calls.
-//
-// It does not close the fd or take ownership of it beyond finalize: DownloadObject
-// truncates the padded tail and fdatasyncs before the caller regains the file, but
-// the caller is still the one who opened (and must close) the underlying *os.File.
+// directly into a pooled aligned buffer instead of io.Copy's 32KB shuttle buffer
+// -- that is the actual benefit of this type; *os.File.WriteAt itself already
+// permits concurrent calls at disjoint offsets to proceed independently (it takes
+// the fd's non-blocking refcount path, not the lock that serializes plain
+// Read/Write), so there is nothing to bypass there.
 type directFileWriterAt struct {
-	fd int
+	f *os.File
 
 	maxEndMu  sync.Mutex
 	maxEndVal int64
 }
 
-// newDirectFileWriterAt enables O_DIRECT on fd and returns a WriterAt that writes
-// through it.
-func newDirectFileWriterAt(fd int) (*directFileWriterAt, error) {
-	if err := enableDirectIO(fd); err != nil {
+// newDirectFileWriterAt enables O_DIRECT on f's fd and returns a WriterAt that
+// writes through it.
+func newDirectFileWriterAt(f *os.File) (*directFileWriterAt, error) {
+	if err := enableDirectIO(int(f.Fd())); err != nil {
 		return nil, err
 	}
-	return &directFileWriterAt{fd: fd}, nil
+	return &directFileWriterAt{f: f}, nil
 }
 
 // chunkSize satisfies syncChunkSink: dlChunk.ReadFrom fills a buffer this size
@@ -65,7 +59,7 @@ func newDirectFileWriterAt(fd int) (*directFileWriterAt, error) {
 func (w *directFileWriterAt) chunkSize() int64 { return defaultWriteChunkSizeBytes }
 
 // writeSync takes ownership of buf (including returning it to the pool) and issues
-// one pwrite before returning, blocking the caller for the write's duration.
+// one WriteAt before returning, blocking the caller for the write's duration.
 func (w *directFileWriterAt) writeSync(buf []byte, n int64, off int64) error {
 	writeLen := n
 	if r := writeLen % directBlockSize; r != 0 {
@@ -76,7 +70,7 @@ func (w *directFileWriterAt) writeSync(buf []byte, n int64, off int64) error {
 		}
 		writeLen += pad
 	}
-	err := pwriteFull(w.fd, buf[:writeLen], off)
+	_, err := w.f.WriteAt(buf[:writeLen], off)
 	putSyncChunkBuf(buf)
 	if err != nil {
 		return err
@@ -115,12 +109,12 @@ func (w *directFileWriterAt) finalSize() int64 {
 
 // finalizeDirectFile truncates the file to the exact object size (undoing
 // O_DIRECT's block padding) and fdatasyncs so the completed data is durable. It
-// does not close fd; the caller who opened the *os.File still owns closing it.
-func finalizeDirectFile(fd int, size int64) error {
-	if err := syscall.Ftruncate(fd, size); err != nil {
+// does not close the file; the caller who opened it still owns closing it.
+func finalizeDirectFile(f *os.File, size int64) error {
+	if err := f.Truncate(size); err != nil {
 		return fmt.Errorf("truncate to %d: %w", size, err)
 	}
-	if err := syscall.Fdatasync(fd); err != nil {
+	if err := syscall.Fdatasync(int(f.Fd())); err != nil {
 		return fmt.Errorf("fdatasync: %w", err)
 	}
 	return nil

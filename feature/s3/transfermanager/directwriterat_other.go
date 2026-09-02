@@ -2,7 +2,10 @@
 
 package transfermanager
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 func directIOAvailable() bool { return false }
 
@@ -16,7 +19,7 @@ func newSyncChunkBuf(size int64) []byte { return make([]byte, size) }
 // constructs one when directIOAvailable() is false.
 type directFileWriterAt struct{}
 
-func newDirectFileWriterAt(fd int) (*directFileWriterAt, error) {
+func newDirectFileWriterAt(f *os.File) (*directFileWriterAt, error) {
 	return nil, fmt.Errorf("O_DIRECT is not supported on this platform")
 }
 
@@ -25,4 +28,4 @@ func (w *directFileWriterAt) chunkSize() int64                               { r
 func (w *directFileWriterAt) writeSync(buf []byte, n int64, off int64) error { return nil }
 func (w *directFileWriterAt) finalSize() int64                               { return 0 }
 
-func finalizeDirectFile(fd int, size int64) error { return nil }
+func finalizeDirectFile(f *os.File, size int64) error { return nil }
