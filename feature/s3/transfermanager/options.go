@@ -71,36 +71,23 @@ type Options struct {
 	// current data buffered. This mechanism avoids unbounded memory usage when downloading large object via GetObject
 	GetObjectBufferSize int64
 
-	// DirectIOThreshold is the object-size threshold in bytes used by DownloadFile:
-	// objects strictly larger than this are written to disk with O_DIRECT (Linux
-	// only), while smaller objects use a buffered writer. If zero,
-	// defaultDirectIOThreshold (100 MiB) is used. Ignored by DownloadObject.
+	// DirectIOThreshold is the object-size threshold in bytes above which
+	// DownloadObject/DownloadFile opt a *os.File destination into O_DIRECT (Linux
+	// only). Objects at or below this size use the caller's WriterAt unmodified. If
+	// zero, defaultDirectIOThreshold (100 MiB) is used.
 	DirectIOThreshold int64
 
-	// DisableDirectIO forces DownloadFile to use the buffered writer regardless of
-	// object size or platform. Ignored by DownloadObject.
+	// DisableDirectIO forces DownloadObject/DownloadFile to leave a *os.File
+	// destination unmodified regardless of object size or platform.
 	DisableDirectIO bool
 
-	// WriteChunkSizeBytes is the fixed size in bytes of each write DownloadFile
-	// issues to the destination file, independent of the download range/part size
-	// (incoming part data is coalesced into chunks of this size). If zero,
-	// defaultWriteChunkSizeBytes (8 MiB) is used. For the O_DIRECT path it is rounded
-	// up to the block size. Ignored by DownloadObject.
+	// WriteChunkSizeBytes is the fixed size in bytes of each O_DIRECT write issued
+	// to a *os.File destination, once DownloadObject has opted it into O_DIRECT.
+	// It is rounded up to the device block size, and PartSizeBytes is in turn
+	// rounded up to a multiple of it, so that no chunk-sized write region ever
+	// needs bytes from two different part-workers. If zero,
+	// defaultWriteChunkSizeBytes (8 MiB) is used.
 	WriteChunkSizeBytes int64
-
-	// WriteFlushWorkers is the number of write-behind flush goroutines DownloadFile
-	// runs per destination file. Completed chunks are handed to this pool so the
-	// download part-workers are not blocked on disk I/O; the count also caps how many
-	// writes hit the device at once. If zero, defaultWriteFlushWorkers (16) is used.
-	// Ignored by DownloadObject.
-	WriteFlushWorkers int
-
-	// WriteFlushQueueDepth is the depth of the bounded queue feeding the flush
-	// workers. It bounds how many completed chunks may wait for the disk (and thus
-	// the write-behind memory headroom) and provides backpressure when the disk falls
-	// behind. If zero, defaultWriteFlushQueueDepth (64) is used. Ignored by
-	// DownloadObject.
-	WriteFlushQueueDepth int
 
 	// Registry of single object progress listener hooks.
 	//
@@ -189,18 +176,6 @@ func resolveDirectIOThreshold(o *Options) {
 func resolveWriteChunkSizeBytes(o *Options) {
 	if o.WriteChunkSizeBytes == 0 {
 		o.WriteChunkSizeBytes = defaultWriteChunkSizeBytes
-	}
-}
-
-func resolveWriteFlushWorkers(o *Options) {
-	if o.WriteFlushWorkers == 0 {
-		o.WriteFlushWorkers = defaultWriteFlushWorkers
-	}
-}
-
-func resolveWriteFlushQueueDepth(o *Options) {
-	if o.WriteFlushQueueDepth == 0 {
-		o.WriteFlushQueueDepth = defaultWriteFlushQueueDepth
 	}
 }
 

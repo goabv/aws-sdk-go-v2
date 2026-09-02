@@ -20,21 +20,21 @@ const defaultPartBodyMaxRetries = 3
 
 const defaultGetBufferSize = 1024 * 1024 * 50
 
-// defaultDirectIOThreshold is the default DownloadFile object-size threshold in
-// bytes above which the destination file is written with O_DIRECT.
+// defaultDirectIOThreshold is the default object-size threshold in bytes above
+// which DownloadObject/DownloadFile opt a *os.File destination into O_DIRECT.
 const defaultDirectIOThreshold = 100 * 1024 * 1024
 
-// defaultWriteChunkSizeBytes is the default fixed size in bytes of each write
-// DownloadFile issues to the destination file.
+// directIOBlockSize is the alignment (bytes) O_DIRECT requires for the write
+// offset, length, and buffer address, on every platform that supports O_DIRECT.
+// Defined here (rather than only in the Linux-only sink files) so
+// cross-platform code, such as DownloadObject's PartSizeBytes/WriteChunkSizeBytes
+// alignment, can reference it without a build-tagged indirection.
+const directIOBlockSize = 4096
+
+// defaultWriteChunkSizeBytes is the default fixed size in bytes of each
+// O_DIRECT write DownloadObject issues to a *os.File destination it has opted
+// into O_DIRECT.
 const defaultWriteChunkSizeBytes = 1024 * 1024 * 8
-
-// defaultWriteFlushWorkers is the default number of write-behind flush goroutines
-// DownloadFile runs per destination file.
-const defaultWriteFlushWorkers = 16
-
-// defaultWriteFlushQueueDepth is the default depth of the bounded queue feeding the
-// DownloadFile flush workers.
-const defaultWriteFlushQueueDepth = 64
 
 // Client provides the API client to make operations call for Amazon Simple
 // Storage Service's Transfer Manager
@@ -63,8 +63,6 @@ func New(s3Client S3APIClient, optFns ...func(*Options)) *Client {
 	resolveMaxUploadParts(&opts)
 	resolveDirectIOThreshold(&opts)
 	resolveWriteChunkSizeBytes(&opts)
-	resolveWriteFlushWorkers(&opts)
-	resolveWriteFlushQueueDepth(&opts)
 
 	return &Client{
 		options: opts,

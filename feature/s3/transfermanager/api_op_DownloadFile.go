@@ -3,12 +3,11 @@ package transfermanager
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // DownloadFileInput represents a request to the DownloadFile() call. It mirrors the
@@ -89,8 +88,8 @@ type DownloadFileInput struct {
 }
 
 // toDownloadObjectInput builds the DownloadObjectInput the shared downloader
-// consumes, wiring the internal file sink as the destination WriterAt.
-func (i *DownloadFileInput) toDownloadObjectInput(w fileSink) *DownloadObjectInput {
+// consumes, wiring the destination file as the WriterAt.
+func (i *DownloadFileInput) toDownloadObjectInput(w io.WriterAt) *DownloadObjectInput {
 	return &DownloadObjectInput{
 		Bucket:                     i.Bucket,
 		Key:                        i.Key,
@@ -116,98 +115,38 @@ func (i *DownloadFileInput) toDownloadObjectInput(w fileSink) *DownloadObjectInp
 	}
 }
 
-// mapHeadObjectInput builds the HeadObject request used to size the object before
-// choosing the destination writer strategy.
-func (i *DownloadFileInput) mapHeadObjectInput() *s3.HeadObjectInput {
-	return &s3.HeadObjectInput{
-		Bucket:               i.Bucket,
-		Key:                  i.Key,
-		ExpectedBucketOwner:  i.ExpectedBucketOwner,
-		IfMatch:              i.IfMatch,
-		IfModifiedSince:      i.IfModifiedSince,
-		IfNoneMatch:          i.IfNoneMatch,
-		IfUnmodifiedSince:    i.IfUnmodifiedSince,
-		Range:                i.Range,
-		RequestPayer:         s3types.RequestPayer(i.RequestPayer),
-		SSECustomerAlgorithm: i.SSECustomerAlgorithm,
-		SSECustomerKey:       i.SSECustomerKey,
-		SSECustomerKeyMD5:    i.SSECustomerKeyMD5,
-		VersionId:            i.VersionID,
-	}
-}
-
 // DownloadFile downloads an object from S3 to a local file at input.FilePath,
 // splitting large objects into parts/ranges fetched in parallel (the same engine
-// as DownloadObject). Unlike DownloadObject, the transfer manager owns the
-// destination writer: objects larger than Options.DirectIOThreshold (default
-// 100 MiB) are written with O_DIRECT on Linux, smaller objects use a buffered
-// writer, and in both cases writes are coalesced into fixed Options.WriteChunkSizeBytes
-// chunks (default 8 MiB) regardless of the download range/part size.
-//
-// DownloadFile defaults to range-based GETs (GetObjectRanges) with an 8 MiB part
-// size; callers can override GetObjectType, PartSizeBytes, Concurrency, and the
-// other download knobs via functional options, exactly as with DownloadObject.
+// as DownloadObject). It opens (creating/truncating) the destination file and
+// delegates to DownloadObject with that *os.File as the WriterAt — DownloadObject
+// decides on its own, based on Options.DisableDirectIO/DirectIOThreshold, whether
+// to opt the file into O_DIRECT. See DownloadObject's WriterAt handling for what
+// opting in changes (forces GetObjectType to GetObjectRanges, rounds
+// PartSizeBytes/WriteChunkSizeBytes to the device block size, and takes ownership
+// of truncating/fdatasyncing the file before returning).
 //
 // The returned DownloadObjectOutput carries the object metadata (the response Body
-// is replaced by the on-disk file).
+// is replaced by the on-disk file). The caller still owns closing the file.
 func (c *Client) DownloadFile(ctx context.Context, input *DownloadFileInput, opts ...func(*Options)) (*DownloadObjectOutput, error) {
 	if input == nil || input.FilePath == "" {
 		return nil, fmt.Errorf("DownloadFile: FilePath is required")
 	}
 
-	options := c.options.Copy()
-	// DownloadFile defaults to range GETs; the client-level default is PART. Applying
-	// this before the per-call opts lets callers override it back to parts.
-	options.GetObjectType = types.GetObjectRanges
-	for _, opt := range opts {
-		opt(&options)
-	}
-	// Defensively re-resolve in case a functional option zeroed a value.
-	resolveConcurrency(&options)
-	resolvePartSizeBytes(&options)
-	resolvePartBodyMaxRetries(&options)
-	resolveDirectIOThreshold(&options)
-	resolveWriteChunkSizeBytes(&options)
-	resolveWriteFlushWorkers(&options)
-	resolveWriteFlushQueueDepth(&options)
-
-	size, err := c.downloadFileObjectSize(ctx, input, &options)
-	if err != nil {
-		return nil, err
-	}
-
-	sink, err := newDownloadFileSink(input.FilePath, size, &options)
+	f, err := os.OpenFile(input.FilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("DownloadFile: open destination %q: %w", input.FilePath, err)
 	}
+	defer f.Close()
 
-	d := downloader{in: input.toDownloadObjectInput(sink), options: options}
-	out, derr := d.download(ctx)
-
-	// Always Close the sink to flush the trailing chunk and finalize/close the file,
-	// even on download error (to release the fd).
-	cerr := sink.Close()
-	if derr != nil {
-		return out, derr
+	options := c.options.Copy()
+	for _, opt := range opts {
+		opt(&options)
 	}
-	if cerr != nil {
-		return out, fmt.Errorf("DownloadFile: finalize destination %q: %w", input.FilePath, cerr)
+
+	d := downloader{in: input.toDownloadObjectInput(f), options: options}
+	out, err := d.download(ctx)
+	if err != nil {
+		return out, fmt.Errorf("DownloadFile: %w", err)
 	}
 	return out, nil
-}
-
-// downloadFileObjectSize determines the size used to choose the destination writer
-// strategy. For a ranged request the destination is only the range length; otherwise
-// it issues a HeadObject to read ContentLength.
-func (c *Client) downloadFileObjectSize(ctx context.Context, input *DownloadFileInput, o *Options) (int64, error) {
-	if r := aws.ToString(input.Range); r != "" {
-		if start, end, err := getReqRange(r); err == nil && end >= start {
-			return end - start + 1, nil
-		}
-	}
-	head, err := o.S3.HeadObject(ctx, input.mapHeadObjectInput())
-	if err != nil {
-		return 0, fmt.Errorf("DownloadFile: HeadObject %q: %w", aws.ToString(input.Key), err)
-	}
-	return aws.ToInt64(head.ContentLength), nil
 }
