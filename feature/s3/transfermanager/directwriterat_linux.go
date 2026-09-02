@@ -39,26 +39,24 @@ func enableDirectIO(fd int) error {
 // the fd's non-blocking refcount path, not the lock that serializes plain
 // Read/Write), so there is nothing to bypass there.
 type directFileWriterAt struct {
-	f              *os.File
-	writeChunkSize int64
+	f *os.File
 
 	maxEndMu  sync.Mutex
 	maxEndVal int64
 }
 
 // newDirectFileWriterAt enables O_DIRECT on f's fd and returns a WriterAt that
-// writes through it in writeChunkSize-sized chunks (the caller has already
-// rounded this up to the device block size; see forceRangesForDirectIO).
-func newDirectFileWriterAt(f *os.File, writeChunkSize int64) (*directFileWriterAt, error) {
+// writes through it.
+func newDirectFileWriterAt(f *os.File) (*directFileWriterAt, error) {
 	if err := enableDirectIO(int(f.Fd())); err != nil {
 		return nil, err
 	}
-	return &directFileWriterAt{f: f, writeChunkSize: writeChunkSize}, nil
+	return &directFileWriterAt{f: f}, nil
 }
 
 // chunkSize satisfies syncChunkSink: dlChunk.ReadFrom fills a buffer this size
 // before each writeSync call.
-func (w *directFileWriterAt) chunkSize() int64 { return w.writeChunkSize }
+func (w *directFileWriterAt) chunkSize() int64 { return defaultWriteChunkSizeBytes }
 
 // writeSync takes ownership of buf (including returning it to the pool) and issues
 // one WriteAt before returning, blocking the caller for the write's duration.
@@ -95,7 +93,7 @@ func (w *directFileWriterAt) bumpMaxEnd(end int64) {
 // not be exercised in practice, but it keeps directFileWriterAt a valid WriterAt on
 // its own terms.
 func (w *directFileWriterAt) WriteAt(p []byte, off int64) (int, error) {
-	buf := getSyncChunkBuf(w.writeChunkSize)
+	buf := getSyncChunkBuf()
 	n := copy(buf, p)
 	if err := w.writeSync(buf, int64(n), off); err != nil {
 		return 0, err

@@ -758,7 +758,7 @@ func (d *downloader) initDirectIO() error {
 		}
 	}
 
-	w, err := newDirectFileWriterAt(f, resolvedDirectIOWriteChunkSize(d.options.WriteChunkSizeBytes))
+	w, err := newDirectFileWriterAt(f)
 	if err != nil {
 		// The filesystem/environment does not support O_DIRECT; fall back to the
 		// caller's plain WriterAt rather than failing the download.
@@ -773,25 +773,16 @@ func (d *downloader) initDirectIO() error {
 	return nil
 }
 
-// resolvedDirectIOWriteChunkSize applies the same default-and-round-up rule
-// forceRangesForDirectIO applies to d.options.WriteChunkSizeBytes, so the
-// directFileWriterAt constructed here and the value forceRangesForDirectIO
-// stores back onto Options agree on the chunk size before a single byte is
-// written.
-func resolvedDirectIOWriteChunkSize(chunkSize int64) int64 {
+func (d *downloader) forceRangesForDirectIO() {
+	d.options.GetObjectType = types.GetObjectRanges
+
+	chunkSize := d.options.WriteChunkSizeBytes
 	if chunkSize <= 0 {
 		chunkSize = defaultWriteChunkSizeBytes
 	}
 	if r := chunkSize % directIOBlockSize; r != 0 {
 		chunkSize += directIOBlockSize - r
 	}
-	return chunkSize
-}
-
-func (d *downloader) forceRangesForDirectIO() {
-	d.options.GetObjectType = types.GetObjectRanges
-
-	chunkSize := resolvedDirectIOWriteChunkSize(d.options.WriteChunkSizeBytes)
 	d.options.WriteChunkSizeBytes = chunkSize
 
 	partSize := d.options.PartSizeBytes
@@ -1078,10 +1069,9 @@ func (c *dlChunk) ReadFrom(r io.Reader) (int64, error) {
 		return io.Copy(&chunkWriterOnly{c}, r)
 	}
 
-	chunkSize := sink.chunkSize()
 	var total int64
 	for {
-		buf := getSyncChunkBuf(chunkSize)
+		buf := getSyncChunkBuf()
 		n, err := io.ReadFull(r, buf)
 		if n > 0 {
 			off := c.start + c.cur
