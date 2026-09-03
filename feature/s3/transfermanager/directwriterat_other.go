@@ -27,5 +27,6 @@ func (w *directFileWriterAt) WriteAt(p []byte, off int64) (int, error)       { r
 func (w *directFileWriterAt) chunkSize() int64                               { return 0 }
 func (w *directFileWriterAt) writeSync(buf []byte, n int64, off int64) error { return nil }
 func (w *directFileWriterAt) finalSize() int64                               { return 0 }
+func (w *directFileWriterAt) drain() error                                   { return nil }
 
 func finalizeDirectFile(f *os.File, size int64) error { return nil }

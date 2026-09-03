@@ -575,6 +575,9 @@ func (d *downloader) download(ctx context.Context) (*DownloadObjectOutput, error
 	out, err := d.downloadNoFinalize(ctx)
 
 	if d.directWriter != nil {
+		if derr := d.directWriter.drain(); derr != nil && err == nil {
+			err = fmt.Errorf("write-behind: %w", derr)
+		}
 		if ferr := finalizeDirectFile(d.directFile, d.directWriter.finalSize()); ferr != nil && err == nil {
 			err = fmt.Errorf("finalize O_DIRECT destination: %w", ferr)
 		}
