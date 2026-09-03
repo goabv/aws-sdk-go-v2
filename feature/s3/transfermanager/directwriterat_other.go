@@ -19,7 +19,7 @@ func newSyncChunkBuf(size int64) []byte { return make([]byte, size) }
 // constructs one when directIOAvailable() is false.
 type directFileWriterAt struct{}
 
-func newDirectFileWriterAt(f *os.File) (*directFileWriterAt, error) {
+func newDirectFileWriterAt(f *os.File, concurrency int) (*directFileWriterAt, error) {
 	return nil, fmt.Errorf("O_DIRECT is not supported on this platform")
 }
 

@@ -16,7 +16,7 @@ func TestDirectFileWriterAt_WriteBehind(t *testing.T) {
 	}
 	defer f.Close()
 
-	w, err := newDirectFileWriterAt(f)
+	w, err := newDirectFileWriterAt(f, 200)
 	if err != nil {
 		t.Skipf("O_DIRECT not available in this environment: %v", err)
 	}
@@ -70,6 +70,30 @@ func TestDirectFileWriterAt_WriteBehind(t *testing.T) {
 	}
 }
 
+func TestDirectWriteWorkers_ScalesWithConcurrency(t *testing.T) {
+	tests := []struct {
+		concurrency int
+		wantWorkers int
+	}{
+		{concurrency: 1, wantWorkers: minDirectWriteWorkers},
+		{concurrency: minDirectWriteWorkers, wantWorkers: minDirectWriteWorkers},
+		{concurrency: 128, wantWorkers: 128},
+		{concurrency: 512, wantWorkers: 512},
+	}
+
+	for _, tt := range tests {
+		workers := directWriteWorkers(tt.concurrency)
+		if workers != tt.wantWorkers {
+			t.Errorf("directWriteWorkers(%d) = %d, want %d", tt.concurrency, workers, tt.wantWorkers)
+		}
+
+		depth := directWriteQueueDepth(workers)
+		if want := workers * directWriteQueueDepthFactor; depth != want {
+			t.Errorf("directWriteQueueDepth(%d) = %d, want %d", workers, depth, want)
+		}
+	}
+}
+
 func TestDirectFileWriterAt_DrainAfterError(t *testing.T) {
 	f, err := os.CreateTemp(t.TempDir(), "directwriterat-*.bin")
 	if err != nil {
@@ -77,7 +101,7 @@ func TestDirectFileWriterAt_DrainAfterError(t *testing.T) {
 	}
 	defer f.Close()
 
-	w, err := newDirectFileWriterAt(f)
+	w, err := newDirectFileWriterAt(f, 32)
 	if err != nil {
 		t.Skipf("O_DIRECT not available in this environment: %v", err)
 	}

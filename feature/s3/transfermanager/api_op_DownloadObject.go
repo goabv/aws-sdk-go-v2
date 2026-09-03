@@ -761,7 +761,7 @@ func (d *downloader) initDirectIO() error {
 		}
 	}
 
-	w, err := newDirectFileWriterAt(f)
+	w, err := newDirectFileWriterAt(f, d.options.Concurrency)
 	if err != nil {
 		// The filesystem/environment does not support O_DIRECT; fall back to the
 		// caller's plain WriterAt rather than failing the download.
