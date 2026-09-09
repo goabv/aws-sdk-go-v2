@@ -29,37 +29,27 @@ func enableDirectIO(fd int) error {
 	return nil
 }
 
-// minDirectWriteWorkers is the floor for directWriteWorkers regardless of
-// Concurrency, so low-concurrency downloads still get a small write-behind pool
-// instead of falling back to near-lockstep behavior.
-const minDirectWriteWorkers = 16
+// directWriteQueueDepth is the number of pending writes directFileWriterAt will
+// buffer before writeSync blocks the calling (network-read) goroutine. Sized as
+// a small multiple of directWriteWorkers so a burst can outrun the workers
+// briefly without immediately reapplying back-pressure.
+const directWriteQueueDepth = 64
 
-// directWriteQueueDepthFactor is the multiple of directWriteWorkers used as
-// queue depth, so a burst can outrun the workers briefly without immediately
-// reapplying back-pressure.
-const directWriteQueueDepthFactor = 4
-
-// directWriteWorkers returns the number of goroutines draining
-// directFileWriterAt's write queue for a download running at the given part
-// Concurrency. Scaled with Concurrency rather than fixed: a pool sized for a
-// low-concurrency download becomes the bottleneck at high Concurrency, since
-// network-read goroutines outrun a fixed-size drain pool and start blocking in
-// writeSync's queue send instead of the disk. This bounds how many WriteAt
-// calls are in flight at once, decoupling that from the number of
-// network-reading part goroutines, while keeping that bound proportional to how
-// many goroutines can be producing writes concurrently.
-func directWriteWorkers(concurrency int) int {
-	if concurrency < minDirectWriteWorkers {
-		return minDirectWriteWorkers
-	}
-	return concurrency
-}
-
-// directWriteQueueDepth returns the write-behind queue depth for a pool of the
-// given size: directWriteQueueDepthFactor times the worker count.
-func directWriteQueueDepth(workers int) int {
-	return workers * directWriteQueueDepthFactor
-}
+// directWriteWorkers is the number of goroutines draining directFileWriterAt's
+// write queue. Fixed and independent of download Concurrency: this bounds how
+// many WriteAt calls are in flight at once, decoupling that from the number of
+// network-reading part goroutines.
+//
+// Measured empirically (not derived): scaling this 1:1 with Concurrency was
+// tried and made throughput worse at every Concurrency/write-chunk-size
+// combination tested (e.g. 512 workers at Concurrency=512 measured 82 Gbps vs
+// 99 Gbps for the fixed value of 16, at the same 8 MiB write chunk size; the
+// gap held at 32 MiB too). More workers means more simultaneous WriteAt calls
+// competing for the same disk, which past a small count adds contention
+// (device-level and/or Go scheduler) rather than relieving it -- the queue-full
+// blocking this pool exists to absorb is not evidence the pool itself is
+// undersized.
+const directWriteWorkers = 16
 
 type directWriteJob struct {
 	buf  []byte
@@ -74,14 +64,13 @@ type directWriteJob struct {
 //
 // It implements syncChunkSink so dlChunk.ReadFrom takes its fast path, reading
 // directly into a pooled aligned buffer instead of io.Copy's 32KB shuttle buffer.
-// Writes are handed to a bounded queue and drained by a pool of worker
-// goroutines sized to Concurrency (write-behind) rather than issued on the
-// caller's goroutine: at high part concurrency a network-read goroutine that
-// blocks in WriteAt stops draining its own socket for the write's duration,
-// which idles that connection's share of the NIC even though WriteAt itself
-// doesn't serialize across goroutines (disjoint offsets proceed independently
-// -- there is nothing to bypass on the disk side, only on the caller's own
-// critical path).
+// Writes are handed to a bounded queue and drained by a fixed pool of worker
+// goroutines (write-behind) rather than issued on the caller's goroutine: at high
+// part concurrency a network-read goroutine that blocks in WriteAt stops draining
+// its own socket for the write's duration, which idles that connection's share of
+// the NIC even though WriteAt itself doesn't serialize across goroutines (disjoint
+// offsets proceed independently -- there is nothing to bypass on the disk side,
+// only on the caller's own critical path).
 type directFileWriterAt struct {
 	f *os.File
 
@@ -96,20 +85,18 @@ type directFileWriterAt struct {
 }
 
 // newDirectFileWriterAt enables O_DIRECT on f's fd, starts the write-behind
-// worker pool sized for concurrency, and returns a WriterAt that writes through
-// it.
-func newDirectFileWriterAt(f *os.File, concurrency int) (*directFileWriterAt, error) {
+// worker pool, and returns a WriterAt that writes through it.
+func newDirectFileWriterAt(f *os.File) (*directFileWriterAt, error) {
 	if err := enableDirectIO(int(f.Fd())); err != nil {
 		return nil, err
 	}
 
-	workers := directWriteWorkers(concurrency)
 	w := &directFileWriterAt{
 		f:     f,
-		queue: make(chan directWriteJob, directWriteQueueDepth(workers)),
+		queue: make(chan directWriteJob, directWriteQueueDepth),
 	}
-	w.wg.Add(workers)
-	for i := 0; i < workers; i++ {
+	w.wg.Add(directWriteWorkers)
+	for i := 0; i < directWriteWorkers; i++ {
 		go w.writeWorker()
 	}
 	return w, nil
