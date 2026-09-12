@@ -16,13 +16,14 @@ func TestDirectFileWriterAt_WriteBehind(t *testing.T) {
 	}
 	defer f.Close()
 
-	w, err := newDirectFileWriterAt(f)
+	direct, err := newDirectFileWriterAt(f)
 	if err != nil {
 		t.Skipf("O_DIRECT not available in this environment: %v", err)
 	}
+	w := newWriteBehindWriterAt(direct, defaultWriteChunkSizeBytes)
 
 	const nChunks = 200
-	chunkSize := int(w.chunkSize())
+	chunkSize := int(w.chunkSize)
 
 	var wg sync.WaitGroup
 	for i := 0; i < nChunks; i++ {
@@ -30,12 +31,12 @@ func TestDirectFileWriterAt_WriteBehind(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			buf := getSyncChunkBuf()
+			buf := w.getBuffer()
 			for j := range buf[:chunkSize] {
 				buf[j] = byte(i)
 			}
-			if err := w.writeSync(buf, int64(chunkSize), int64(i*chunkSize)); err != nil {
-				t.Errorf("writeSync chunk %d: %v", i, err)
+			if _, err := w.enqueue(buf, int64(chunkSize), int64(i*chunkSize)); err != nil {
+				t.Errorf("enqueue chunk %d: %v", i, err)
 			}
 		}()
 	}
@@ -77,26 +78,27 @@ func TestDirectFileWriterAt_DrainAfterError(t *testing.T) {
 	}
 	defer f.Close()
 
-	w, err := newDirectFileWriterAt(f)
+	direct, err := newDirectFileWriterAt(f)
 	if err != nil {
 		t.Skipf("O_DIRECT not available in this environment: %v", err)
 	}
+	w := newWriteBehindWriterAt(direct, defaultWriteChunkSizeBytes)
 
 	if err := f.Close(); err != nil {
 		t.Fatalf("close file: %v", err)
 	}
 
-	buf := getSyncChunkBuf()
-	if err := w.writeSync(buf, w.chunkSize(), 0); err != nil {
-		t.Fatalf("writeSync (enqueue) unexpected error: %v", err)
+	buf := w.getBuffer()
+	if _, err := w.enqueue(buf, w.chunkSize, 0); err != nil {
+		t.Fatalf("enqueue unexpected error: %v", err)
 	}
 
 	if err := w.drain(); err == nil {
 		t.Fatal("drain: expected error from write to closed file, got nil")
 	}
 
-	buf2 := getSyncChunkBuf()
-	if err := w.writeSync(buf2, w.chunkSize(), 0); err == nil {
-		t.Fatal("writeSync after drain error: expected error to be returned immediately")
+	buf2 := w.getBuffer()
+	if _, err := w.enqueue(buf2, w.chunkSize, 0); err == nil {
+		t.Fatal("enqueue after drain error: expected error to be returned immediately")
 	}
 }

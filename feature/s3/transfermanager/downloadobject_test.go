@@ -7,6 +7,7 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -578,6 +579,220 @@ func TestDownloadObject(t *testing.T) {
 				c.dataValidationFn(t, w)
 			}
 		})
+	}
+}
+
+type blockingWriterAt struct {
+	release <-chan struct{}
+
+	mu   sync.Mutex
+	data []byte
+}
+
+func (w *blockingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	<-w.release
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	end := int(off) + len(p)
+	if end > len(w.data) {
+		w.data = append(w.data, make([]byte, end-len(w.data))...)
+	}
+	return copy(w.data[off:], p), nil
+}
+
+func (w *blockingWriterAt) bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return bytes.Clone(w.data)
+}
+
+type closeSignalBody struct {
+	io.Reader
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *closeSignalBody) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+type zeroThenReader struct {
+	reader io.Reader
+	zero   bool
+}
+
+func (r *zeroThenReader) Read(p []byte) (int, error) {
+	if !r.zero {
+		r.zero = true
+		return 0, nil
+	}
+	return r.reader.Read(p)
+}
+
+func TestReadWriteBehindChunk_TemporaryZeroRead(t *testing.T) {
+	want := []byte("data")
+	buf := make([]byte, len(want))
+	n, err := readWriteBehindChunk(&zeroThenReader{reader: bytes.NewReader(want)}, buf)
+	if err != nil {
+		t.Fatalf("readWriteBehindChunk: %v", err)
+	}
+	if n != len(want) || !bytes.Equal(buf, want) {
+		t.Fatalf("read %d bytes %q, want %d bytes %q", n, buf, len(want), want)
+	}
+}
+
+func TestDownloadObject_GenericWriterAtUsesWriteBehind(t *testing.T) {
+	want := []byte("generic writer-at write-behind")
+	bodyClosed := make(chan struct{})
+	releaseWrites := make(chan struct{})
+	writer := &blockingWriterAt{release: releaseWrites}
+
+	s3Client := &s3testing.TransferManagerLoggingClient{}
+	s3Client.GetObjectFn = func(*s3testing.TransferManagerLoggingClient, *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+		return &s3.GetObjectOutput{
+			Body:          &closeSignalBody{Reader: bytes.NewReader(want), closed: bodyClosed},
+			ContentLength: aws.Int64(int64(len(want))),
+			PartsCount:    aws.Int32(1),
+		}, nil
+	}
+
+	client := New(s3Client, func(o *Options) {
+		o.WriteChunkSizeBytes = 4
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.DownloadObject(context.Background(), &DownloadObjectInput{
+			Bucket:   aws.String("bucket"),
+			Key:      aws.String("key"),
+			WriterAt: writer,
+		})
+		result <- err
+	}()
+
+	select {
+	case <-bodyClosed:
+	case <-time.After(time.Second):
+		close(releaseWrites)
+		t.Fatal("response body was not consumed while WriterAt was blocked")
+	}
+
+	select {
+	case err := <-result:
+		t.Fatalf("DownloadObject returned before draining write-behind: %v", err)
+	default:
+	}
+
+	close(releaseWrites)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("DownloadObject: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DownloadObject did not return after WriterAt was released")
+	}
+
+	if got := writer.bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("written data = %q, want %q", got, want)
+	}
+}
+
+type failingWriterAt struct {
+	err error
+}
+
+func (w failingWriterAt) WriteAt([]byte, int64) (int, error) {
+	return 0, w.err
+}
+
+func TestDownloadObject_GenericWriterAtWriteError(t *testing.T) {
+	writeErr := fmt.Errorf("destination failed")
+	s3Client := &s3testing.TransferManagerLoggingClient{}
+	s3Client.GetObjectFn = func(*s3testing.TransferManagerLoggingClient, *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+		body := []byte("data")
+		return &s3.GetObjectOutput{
+			Body:          io.NopCloser(bytes.NewReader(body)),
+			ContentLength: aws.Int64(int64(len(body))),
+			PartsCount:    aws.Int32(1),
+		}, nil
+	}
+
+	client := New(s3Client, func(o *Options) {
+		o.WriteChunkSizeBytes = 4
+	})
+	input := &DownloadObjectInput{
+		Bucket:   aws.String("bucket"),
+		Key:      aws.String("key"),
+		WriterAt: failingWriterAt{err: writeErr},
+	}
+	listener := &mockListener{}
+	_, err := client.DownloadObject(context.Background(), input, func(o *Options) {
+		o.ObjectProgressListeners.Register(listener)
+	})
+	if err == nil || !strings.Contains(err.Error(), writeErr.Error()) {
+		t.Fatalf("DownloadObject error = %v, want %v", err, writeErr)
+	}
+	listener.expectFailed(t, input, err)
+}
+
+func TestDownloadObject_DoesNotReplaceInputWriterAt(t *testing.T) {
+	want := []byte("reusable input")
+	s3Client := &s3testing.TransferManagerLoggingClient{}
+	s3Client.GetObjectFn = func(*s3testing.TransferManagerLoggingClient, *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+		return &s3.GetObjectOutput{
+			Body:          io.NopCloser(bytes.NewReader(want)),
+			ContentLength: aws.Int64(int64(len(want))),
+			PartsCount:    aws.Int32(1),
+		}, nil
+	}
+
+	writer := types.NewWriteAtBuffer(nil)
+	input := &DownloadObjectInput{
+		Bucket:   aws.String("bucket"),
+		Key:      aws.String("key"),
+		WriterAt: writer,
+	}
+	client := New(s3Client, func(o *Options) {
+		o.WriteChunkSizeBytes = 4
+	})
+	for i := 0; i < 2; i++ {
+		if _, err := client.DownloadObject(context.Background(), input); err != nil {
+			t.Fatalf("DownloadObject call %d: %v", i+1, err)
+		}
+		if input.WriterAt != writer {
+			t.Fatalf("DownloadObject call %d replaced input WriterAt", i+1)
+		}
+	}
+	if got := writer.Bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("written data = %q, want %q", got, want)
+	}
+}
+
+func TestDownloadObject_WriteErrorNotMaskedByBodyError(t *testing.T) {
+	writeErr := fmt.Errorf("destination failed")
+	s3Client := &s3testing.TransferManagerLoggingClient{}
+	s3Client.GetObjectFn = func(*s3testing.TransferManagerLoggingClient, *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+		reader := &s3testing.TestErrReader{Buf: []byte("ab"), Len: 3, Err: io.ErrUnexpectedEOF}
+		return &s3.GetObjectOutput{
+			Body:          io.NopCloser(reader),
+			ContentLength: aws.Int64(reader.Len),
+			PartsCount:    aws.Int32(1),
+		}, nil
+	}
+
+	client := New(s3Client, func(o *Options) {
+		o.PartBodyMaxRetries = 1
+		o.WriteChunkSizeBytes = 4
+	})
+	_, err := client.DownloadObject(context.Background(), &DownloadObjectInput{
+		Bucket:   aws.String("bucket"),
+		Key:      aws.String("key"),
+		WriterAt: failingWriterAt{err: writeErr},
+	})
+	if err == nil || !strings.Contains(err.Error(), writeErr.Error()) {
+		t.Fatalf("DownloadObject error = %v, want %v", err, writeErr)
 	}
 }
 

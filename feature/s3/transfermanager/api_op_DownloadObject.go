@@ -559,12 +559,11 @@ type downloader struct {
 	written    atomic.Int64
 	etag       string
 
-	// directWriter and directFile are set by initDirectIO when the caller's
-	// WriterAt was a *os.File opted into O_DIRECT. directWriter is nil otherwise;
-	// download uses its presence to decide whether to finalize (truncate +
-	// fdatasync) the destination file before returning.
-	directWriter *directFileWriterAt
-	directFile   *os.File
+	// writeTarget is the caller's WriterAt or its O_DIRECT adapter. writeBehind
+	// wraps it without replacing the WriterAt stored in the caller's input.
+	writeTarget io.WriterAt
+	writeBehind *writeBehindWriterAt
+	directFile  *os.File
 
 	err error
 
@@ -574,12 +573,24 @@ type downloader struct {
 func (d *downloader) download(ctx context.Context) (*DownloadObjectOutput, error) {
 	out, err := d.downloadNoFinalize(ctx)
 
-	if d.directWriter != nil {
-		if derr := d.directWriter.drain(); derr != nil && err == nil {
+	if d.writeBehind != nil {
+		if derr := d.writeBehind.drain(); derr != nil {
 			err = fmt.Errorf("write-behind: %w", derr)
 		}
-		if ferr := finalizeDirectFile(d.directFile, d.directWriter.finalSize()); ferr != nil && err == nil {
+	}
+	if d.directFile != nil {
+		if ferr := finalizeDirectFile(d.directFile, d.writeBehind.finalSize()); ferr != nil && err == nil {
 			err = fmt.Errorf("finalize O_DIRECT destination: %w", ferr)
+		}
+	}
+
+	if d.emitter != nil {
+		if err != nil {
+			freshCtx, cancel := d.freshContext(ctx)
+			defer cancel()
+			d.emitter.Failed(freshCtx, err)
+		} else {
+			d.emitter.Complete(ctx, out)
 		}
 	}
 
@@ -603,9 +614,6 @@ func (d *downloader) downloadNoFinalize(ctx context.Context) (*DownloadObjectOut
 	if d.options.GetObjectType == types.GetObjectParts {
 		output = d.getChunk(ctx, 1, "", clientOptions...)
 		if d.err != nil {
-			freshCtx, cancel := d.freshContext(ctx)
-			defer cancel()
-			d.emitter.Failed(freshCtx, d.err)
 			return output, d.err
 		}
 
@@ -622,7 +630,7 @@ func (d *downloader) downloadNoFinalize(ctx context.Context) (*DownloadObjectOut
 					break
 				}
 
-				ch <- dlChunk{w: d.in.WriterAt, start: d.pos - d.offset, part: i}
+				ch <- dlChunk{w: d.writeBehind, start: d.pos - d.offset, part: i}
 				d.pos += partSize
 			}
 
@@ -633,9 +641,6 @@ func (d *downloader) downloadNoFinalize(ctx context.Context) (*DownloadObjectOut
 		if rng := aws.ToString(d.in.Range); rng != "" {
 			rangeStart, rangeEnd, err := getReqRange(rng)
 			if err != nil {
-				freshCtx, cancel := d.freshContext(ctx)
-				defer cancel()
-				d.emitter.Failed(freshCtx, d.err)
 				return nil, err
 			}
 			d.offset = rangeStart
@@ -654,13 +659,9 @@ func (d *downloader) downloadNoFinalize(ctx context.Context) (*DownloadObjectOut
 					out := &DownloadObjectOutput{
 						ContentLength: aws.Int64(0),
 					}
-					d.emitter.Complete(ctx, out)
 					return out, nil
 				}
 			}
-			freshCtx, cancel := d.freshContext(ctx)
-			defer cancel()
-			d.emitter.Failed(freshCtx, d.err)
 			return nil, d.err
 		}
 		total := d.totalBytes
@@ -678,7 +679,7 @@ func (d *downloader) downloadNoFinalize(ctx context.Context) (*DownloadObjectOut
 			}
 
 			// Queue the next range of bytes to read.
-			ch <- dlChunk{w: d.in.WriterAt, start: d.pos - d.offset, withRange: d.byteRange()}
+			ch <- dlChunk{w: d.writeBehind, start: d.pos - d.offset, withRange: d.byteRange()}
 			d.pos += d.options.PartSizeBytes
 		}
 
@@ -688,13 +689,8 @@ func (d *downloader) downloadNoFinalize(ctx context.Context) (*DownloadObjectOut
 	}
 
 	if d.err != nil {
-		freshCtx, cancel := d.freshContext(ctx)
-		defer cancel()
-		d.emitter.Failed(freshCtx, d.err)
 		return nil, d.err
 	}
-
-	d.emitter.Complete(ctx, d.out)
 
 	d.out.ContentRange = aws.String(fmt.Sprintf("bytes=%d-%d", d.offset, d.totalBytes-1))
 	d.out.ContentLength = aws.Int64(d.written.Load())
@@ -717,6 +713,7 @@ func (d *downloader) init() error {
 		return err
 	}
 
+	d.writeBehind = newWriteBehindWriterAt(d.writeTarget, d.options.WriteChunkSizeBytes)
 	d.totalBytes = -1
 	d.emitter = &singleObjectProgressEmitter{
 		Listeners: d.options.ObjectProgressListeners,
@@ -743,10 +740,11 @@ func (d *downloader) init() error {
 // Without an explicit Range, DirectIOThreshold has no effect and every *os.File
 // destination is opted into O_DIRECT.
 //
-// A caller that wants the plain, caller-controlled WriterAt behavior can either
-// pass a WriterAt that is not a *os.File, or set DisableDirectIO.
+// WriterAt implementations other than *os.File still use async write-behind,
+// but are never opted into O_DIRECT or finalized as files.
 func (d *downloader) initDirectIO() error {
-	f, ok := d.in.WriterAt.(*os.File)
+	d.writeTarget = d.in.WriterAt
+	f, ok := d.writeTarget.(*os.File)
 	if !ok || !directIOAvailable() || d.options.DisableDirectIO {
 		return nil
 	}
@@ -763,15 +761,14 @@ func (d *downloader) initDirectIO() error {
 
 	w, err := newDirectFileWriterAt(f)
 	if err != nil {
-		// The filesystem/environment does not support O_DIRECT; fall back to the
-		// caller's plain WriterAt rather than failing the download.
+		// The filesystem/environment does not support O_DIRECT; use the caller's
+		// WriterAt as the write-behind destination rather than failing the download.
 		return nil
 	}
 
 	d.forceRangesForDirectIO()
 
-	d.in.WriterAt = w
-	d.directWriter = w
+	d.writeTarget = w
 	d.directFile = f
 	return nil
 }
@@ -820,7 +817,7 @@ func (d *downloader) downloadPart(ctx context.Context, ch chan dlChunk, clientOp
 // getChunk grabs a chunk of data from the body.
 // Not thread safe. Should only be used when grabbing data on a single thread.
 func (d *downloader) getChunk(ctx context.Context, part int32, rng string, clientOptions ...func(*s3.Options)) *DownloadObjectOutput {
-	chunk := dlChunk{w: d.in.WriterAt, start: d.pos - d.offset, part: part, withRange: rng}
+	chunk := dlChunk{w: d.writeBehind, start: d.pos - d.offset, part: part, withRange: rng}
 
 	output, err := d.downloadChunk(ctx, chunk, clientOptions...)
 	if err != nil {
@@ -1049,56 +1046,67 @@ func (c *dlChunk) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// syncChunkSink is a benchmark-only escape hatch: a destination that owns pooled,
-// chunk-sized buffers and writes them synchronously (no flush queue, no region
-// map). dlChunk.ReadFrom uses this directly when c.w implements it, bypassing
-// WriteAt/chunkedWriterAt entirely for the write path.
-type syncChunkSink interface {
-	// chunkSize returns the fixed buffer size ReadFrom should fill before writing.
-	chunkSize() int64
-	// writeSync takes ownership of buf (length n, no further writes to it by the
-	// caller) and writes it to disk at off before returning.
-	writeSync(buf []byte, n int64, off int64) error
+// writeBehindSink owns the buffers passed to enqueue. dlChunk.ReadFrom uses
+// this path to hand full chunks to the destination without io.Copy's intermediate
+// buffer or waiting for each WriteAt call to finish.
+type writeBehindSink interface {
+	getBuffer() []byte
+	putBuffer([]byte)
+	enqueue(buf []byte, n int64, off int64) (uint64, error)
+	waitThrough(seq uint64) error
 }
 
-// ReadFrom reads r (one part's response body) directly into a pooled,
-// chunkSize()-sized buffer and writes it synchronously via c.w's syncChunkSink,
-// avoiding both io.Copy's 32KB shuttle buffer and chunkedWriterAt's region-map
-// copy. Falls back to the generic io.Copy(c, r) path (through Write/WriteAt) if
-// c.w does not implement syncChunkSink.
 func (c *dlChunk) ReadFrom(r io.Reader) (int64, error) {
-	sink, ok := c.w.(syncChunkSink)
+	sink, ok := c.w.(writeBehindSink)
 	if !ok {
 		return io.Copy(&chunkWriterOnly{c}, r)
 	}
 
 	var total int64
+	var lastSeq uint64
 	for {
-		buf := getSyncChunkBuf()
-		n, err := io.ReadFull(r, buf)
+		buf := sink.getBuffer()
+		n, err := readWriteBehindChunk(r, buf)
 		if n > 0 {
 			off := c.start + c.cur
-			// writeSync takes ownership of buf (including returning it to the pool),
-			// regardless of success or failure.
-			if werr := sink.writeSync(buf, int64(n), off); werr != nil {
+			seq, werr := sink.enqueue(buf, int64(n), off)
+			if werr != nil {
 				return total, werr
 			}
+			lastSeq = seq
 			c.cur += int64(n)
 			total += int64(n)
 		} else {
-			putSyncChunkBuf(buf)
+			sink.putBuffer(buf)
 		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if err == io.EOF {
 			return total, nil
 		}
 		if err != nil {
+			if lastSeq != 0 {
+				if werr := sink.waitThrough(lastSeq); werr != nil {
+					return total, werr
+				}
+			}
 			return total, err
 		}
 	}
 }
 
-// chunkWriterOnly hides ReadFrom so io.Copy takes its generic path (used by the
-// syncChunkSink fallback above, to avoid ReadFrom recursing into itself).
+func readWriteBehindChunk(r io.Reader, buf []byte) (int, error) {
+	var n int
+	for n < len(buf) {
+		nr, err := r.Read(buf[n:])
+		n += nr
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+// chunkWriterOnly hides ReadFrom so io.Copy takes its generic path without
+// recursing into dlChunk.ReadFrom.
 type chunkWriterOnly struct{ c *dlChunk }
 
 func (w *chunkWriterOnly) Write(p []byte) (int, error) { return w.c.Write(p) }

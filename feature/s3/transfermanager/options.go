@@ -73,19 +73,18 @@ type Options struct {
 
 	// DirectIOThreshold is the object-size threshold in bytes above which
 	// DownloadObject/DownloadFile opt a *os.File destination into O_DIRECT (Linux
-	// only). Objects at or below this size use the caller's WriterAt unmodified. If
-	// zero, defaultDirectIOThreshold (100 MiB) is used.
+	// only). Objects at or below this size still use async write-behind, but do not
+	// use O_DIRECT. If zero, defaultDirectIOThreshold (100 MiB) is used.
 	DirectIOThreshold int64
 
-	// DisableDirectIO forces DownloadObject/DownloadFile to leave a *os.File
-	// destination unmodified regardless of object size or platform.
+	// DisableDirectIO prevents DownloadObject/DownloadFile from opting a *os.File
+	// destination into O_DIRECT. It does not disable async write-behind.
 	DisableDirectIO bool
 
-	// WriteChunkSizeBytes is the fixed size in bytes of each O_DIRECT write issued
-	// to a *os.File destination, once DownloadObject has opted it into O_DIRECT.
-	// It is rounded up to the device block size, and PartSizeBytes is in turn
-	// rounded up to a multiple of it, so that no chunk-sized write region ever
-	// needs bytes from two different part-workers. If zero,
+	// WriteChunkSizeBytes is the fixed size in bytes of each async write-behind
+	// chunk issued to a DownloadObject/DownloadFile WriterAt. For a *os.File
+	// destination opted into O_DIRECT, it is rounded up to the device block size,
+	// and PartSizeBytes is in turn rounded up to a multiple of it. If zero,
 	// defaultWriteChunkSizeBytes (8 MiB) is used.
 	WriteChunkSizeBytes int64
 

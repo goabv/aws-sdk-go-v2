@@ -31,9 +31,8 @@ const defaultDirectIOThreshold = 100 * 1024 * 1024
 // alignment, can reference it without a build-tagged indirection.
 const directIOBlockSize = 4096
 
-// defaultWriteChunkSizeBytes is the default fixed size in bytes of each
-// O_DIRECT write DownloadObject issues to a *os.File destination it has opted
-// into O_DIRECT.
+// defaultWriteChunkSizeBytes is the default chunk size used by DownloadObject's
+// async write-behind queue.
 const defaultWriteChunkSizeBytes = 1024 * 1024 * 8
 
 // Client provides the API client to make operations call for Amazon Simple

@@ -25,8 +25,8 @@ func alignedBuf(size, align int64) []byte {
 	return b[off : off+size]
 }
 
-// newSyncChunkBuf allocates a buffer for syncChunkPool, block-aligned for
-// O_DIRECT.
+// newSyncChunkBuf allocates a block-aligned write-behind buffer so the same
+// queue buffers can be used when the destination has O_DIRECT enabled.
 func newSyncChunkBuf(size int64) []byte {
 	return alignedBuf(size, directBlockSize)
 }
