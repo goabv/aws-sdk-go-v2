@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -559,11 +558,7 @@ type downloader struct {
 	written    atomic.Int64
 	etag       string
 
-	// writeTarget is the caller's WriterAt or its O_DIRECT adapter. writeBehind
-	// wraps it without replacing the WriterAt stored in the caller's input.
-	writeTarget io.WriterAt
 	writeBehind *writeBehindWriterAt
-	directFile  *os.File
 
 	err error
 
@@ -578,12 +573,6 @@ func (d *downloader) download(ctx context.Context) (*DownloadObjectOutput, error
 			err = fmt.Errorf("write-behind: %w", derr)
 		}
 	}
-	if d.directFile != nil {
-		if ferr := finalizeDirectFile(d.directFile, d.writeBehind.finalSize()); ferr != nil && err == nil {
-			err = fmt.Errorf("finalize O_DIRECT destination: %w", ferr)
-		}
-	}
-
 	if d.emitter != nil {
 		if err != nil {
 			freshCtx, cancel := d.freshContext(ctx)
@@ -709,90 +698,13 @@ func (d *downloader) init() error {
 		return fmt.Errorf("part body retry must be non-negative")
 	}
 
-	if err := d.initDirectIO(); err != nil {
-		return err
-	}
-
-	d.writeBehind = newWriteBehindWriterAt(d.writeTarget, d.options.WriteChunkSizeBytes)
+	d.writeBehind = newWriteBehindWriterAt(d.in.WriterAt, d.options.WriteChunkSizeBytes)
 	d.totalBytes = -1
 	d.emitter = &singleObjectProgressEmitter{
 		Listeners: d.options.ObjectProgressListeners,
 	}
 
 	return nil
-}
-
-// initDirectIO opts a caller-supplied *os.File destination into O_DIRECT writes
-// when the caller has not disabled it (DisableDirectIO). Opting in means
-// DownloadObject takes control of GetObjectType (forced to GetObjectRanges, since
-// part boundaries come from S3's own upload and cannot be made to align to the
-// device block size) and PartSizeBytes (rounded up to a multiple of
-// WriteChunkSizeBytes, itself rounded up to the block size), and DownloadObject
-// finalizes (truncates the O_DIRECT tail padding and fdatasyncs) the file before
-// returning — the caller still owns opening and closing the *os.File, but should
-// not write to or read from it between the DownloadObject call and Close.
-//
-// DirectIOThreshold only gates the decision when the size is already known for
-// free, i.e. when the caller set an explicit Range: probing the size with a
-// HeadObject first would add a second serial round-trip on top of the download's
-// own serial first request (see byteRange/getChunk), doubling exactly the
-// request-serialization cost documented as a known cost of the range-mode path.
-// Without an explicit Range, DirectIOThreshold has no effect and every *os.File
-// destination is opted into O_DIRECT.
-//
-// WriterAt implementations other than *os.File still use async write-behind,
-// but are never opted into O_DIRECT or finalized as files.
-func (d *downloader) initDirectIO() error {
-	d.writeTarget = d.in.WriterAt
-	f, ok := d.writeTarget.(*os.File)
-	if !ok || !directIOAvailable() || d.options.DisableDirectIO {
-		return nil
-	}
-
-	if d.options.DirectIOThreshold > 0 {
-		if rng := aws.ToString(d.in.Range); rng != "" {
-			if start, end, err := getReqRange(rng); err == nil && end >= start {
-				if end-start+1 <= d.options.DirectIOThreshold {
-					return nil
-				}
-			}
-		}
-	}
-
-	w, err := newDirectFileWriterAt(f)
-	if err != nil {
-		// The filesystem/environment does not support O_DIRECT; use the caller's
-		// WriterAt as the write-behind destination rather than failing the download.
-		return nil
-	}
-
-	d.forceRangesForDirectIO()
-
-	d.writeTarget = w
-	d.directFile = f
-	return nil
-}
-
-func (d *downloader) forceRangesForDirectIO() {
-	d.options.GetObjectType = types.GetObjectRanges
-
-	chunkSize := d.options.WriteChunkSizeBytes
-	if chunkSize <= 0 {
-		chunkSize = defaultWriteChunkSizeBytes
-	}
-	if r := chunkSize % directIOBlockSize; r != 0 {
-		chunkSize += directIOBlockSize - r
-	}
-	d.options.WriteChunkSizeBytes = chunkSize
-
-	partSize := d.options.PartSizeBytes
-	if partSize <= 0 {
-		partSize = defaultPartSizeBytes
-	}
-	if r := partSize % chunkSize; r != 0 {
-		partSize += chunkSize - r
-	}
-	d.options.PartSizeBytes = partSize
 }
 
 func (d *downloader) downloadPart(ctx context.Context, ch chan dlChunk, clientOptions ...func(*s3.Options)) {

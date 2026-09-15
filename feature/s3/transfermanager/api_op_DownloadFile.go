@@ -12,9 +12,7 @@ import (
 
 // DownloadFileInput represents a request to the DownloadFile() call. It mirrors the
 // common fields of an S3 GetObject request, but instead of a caller-supplied
-// io.WriterAt the object is written to a local file at FilePath. The transfer
-// manager owns the destination writer, which lets it pick an O_DIRECT or buffered
-// strategy based on object size and write in fixed-size chunks.
+// io.WriterAt the object is written to a local file at FilePath.
 type DownloadFileInput struct {
 	// Bucket where the object is downloaded from.
 	Bucket *string
@@ -118,12 +116,8 @@ func (i *DownloadFileInput) toDownloadObjectInput(w io.WriterAt) *DownloadObject
 // DownloadFile downloads an object from S3 to a local file at input.FilePath,
 // splitting large objects into parts/ranges fetched in parallel (the same engine
 // as DownloadObject). It opens (creating/truncating) the destination file and
-// delegates to DownloadObject with that *os.File as the WriterAt — DownloadObject
-// decides on its own, based on Options.DisableDirectIO/DirectIOThreshold, whether
-// to opt the file into O_DIRECT. See DownloadObject's WriterAt handling for what
-// opting in changes (forces GetObjectType to GetObjectRanges, rounds
-// PartSizeBytes/WriteChunkSizeBytes to the device block size, and takes ownership
-// of truncating/fdatasyncing the file before returning).
+// delegates to DownloadObject with that *os.File as the WriterAt. DownloadObject
+// writes to the file through its asynchronous write-behind queue.
 //
 // The returned DownloadObjectOutput carries the object metadata (the response Body
 // is replaced by the on-disk file). The caller still owns closing the file.

@@ -71,20 +71,8 @@ type Options struct {
 	// current data buffered. This mechanism avoids unbounded memory usage when downloading large object via GetObject
 	GetObjectBufferSize int64
 
-	// DirectIOThreshold is the object-size threshold in bytes above which
-	// DownloadObject/DownloadFile opt a *os.File destination into O_DIRECT (Linux
-	// only). Objects at or below this size still use async write-behind, but do not
-	// use O_DIRECT. If zero, defaultDirectIOThreshold (100 MiB) is used.
-	DirectIOThreshold int64
-
-	// DisableDirectIO prevents DownloadObject/DownloadFile from opting a *os.File
-	// destination into O_DIRECT. It does not disable async write-behind.
-	DisableDirectIO bool
-
 	// WriteChunkSizeBytes is the fixed size in bytes of each async write-behind
-	// chunk issued to a DownloadObject/DownloadFile WriterAt. For a *os.File
-	// destination opted into O_DIRECT, it is rounded up to the device block size,
-	// and PartSizeBytes is in turn rounded up to a multiple of it. If zero,
+	// chunk issued to a DownloadObject/DownloadFile WriterAt. If zero,
 	// defaultWriteChunkSizeBytes (8 MiB) is used.
 	WriteChunkSizeBytes int64
 
@@ -163,12 +151,6 @@ func resolveGetBufferSize(o *Options) {
 func resolveMaxUploadParts(o *Options) {
 	if o.MaxUploadParts == 0 {
 		o.MaxUploadParts = defaultMaxUploadParts
-	}
-}
-
-func resolveDirectIOThreshold(o *Options) {
-	if o.DirectIOThreshold == 0 {
-		o.DirectIOThreshold = defaultDirectIOThreshold
 	}
 }
 

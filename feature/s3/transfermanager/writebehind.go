@@ -8,7 +8,7 @@ import (
 )
 
 const writeBehindQueueDepth = 64
-const writeBehindWorkers = 16
+const writeBehindWorkers = 64
 
 type writeBehindJob struct {
 	buf  []byte
@@ -39,9 +39,6 @@ type writeBehindWriterAt struct {
 	completedThrough uint64
 	completed        map[uint64]struct{}
 
-	maxEndMu  sync.Mutex
-	maxEndVal int64
-
 	errOnce sync.Once
 	errVal  atomic.Pointer[error]
 }
@@ -56,7 +53,7 @@ func newWriteBehindWriterAt(w io.WriterAt, chunkSize int64) *writeBehindWriterAt
 		chunkSize: chunkSize,
 		queue:     make(chan writeBehindJob, writeBehindQueueDepth),
 	}
-	writer.pool.New = func() any { return newSyncChunkBuf(chunkSize) }
+	writer.pool.New = func() any { return make([]byte, chunkSize) }
 	writer.completeCond = sync.NewCond(&writer.completeMu)
 	writer.completed = map[uint64]struct{}{}
 	writer.wg.Add(writeBehindWorkers)
@@ -108,8 +105,6 @@ func (w *writeBehindWriterAt) doWrite(job writeBehindJob) {
 	if err != nil {
 		err = fmt.Errorf("write-behind WriteAt at offset %d: %w", job.off, err)
 		w.setErr(err)
-	} else {
-		w.bumpMaxEnd(job.off + job.n)
 	}
 
 	w.putBuffer(job.buf)
@@ -202,18 +197,4 @@ func (w *writeBehindWriterAt) drain() error {
 
 	w.wg.Wait()
 	return w.err()
-}
-
-func (w *writeBehindWriterAt) bumpMaxEnd(end int64) {
-	w.maxEndMu.Lock()
-	if end > w.maxEndVal {
-		w.maxEndVal = end
-	}
-	w.maxEndMu.Unlock()
-}
-
-func (w *writeBehindWriterAt) finalSize() int64 {
-	w.maxEndMu.Lock()
-	defer w.maxEndMu.Unlock()
-	return w.maxEndVal
 }

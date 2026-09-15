@@ -20,17 +20,6 @@ const defaultPartBodyMaxRetries = 3
 
 const defaultGetBufferSize = 1024 * 1024 * 50
 
-// defaultDirectIOThreshold is the default object-size threshold in bytes above
-// which DownloadObject/DownloadFile opt a *os.File destination into O_DIRECT.
-const defaultDirectIOThreshold = 100 * 1024 * 1024
-
-// directIOBlockSize is the alignment (bytes) O_DIRECT requires for the write
-// offset, length, and buffer address, on every platform that supports O_DIRECT.
-// Defined here (rather than only in the Linux-only sink files) so
-// cross-platform code, such as DownloadObject's PartSizeBytes/WriteChunkSizeBytes
-// alignment, can reference it without a build-tagged indirection.
-const directIOBlockSize = 4096
-
 // defaultWriteChunkSizeBytes is the default chunk size used by DownloadObject's
 // async write-behind queue.
 const defaultWriteChunkSizeBytes = 1024 * 1024 * 8
@@ -60,7 +49,6 @@ func New(s3Client S3APIClient, optFns ...func(*Options)) *Client {
 	resolvePartBodyMaxRetries(&opts)
 	resolveGetBufferSize(&opts)
 	resolveMaxUploadParts(&opts)
-	resolveDirectIOThreshold(&opts)
 	resolveWriteChunkSizeBytes(&opts)
 
 	return &Client{
