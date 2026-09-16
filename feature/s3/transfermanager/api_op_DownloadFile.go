@@ -2,13 +2,19 @@ package transfermanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 )
+
+type downloadFilePreallocator interface {
+	preallocate(size int64) error
+}
 
 // DownloadFileInput represents a request to the DownloadFile() call. It mirrors the
 // common fields of an S3 GetObject request, but instead of a caller-supplied
@@ -114,33 +120,69 @@ func (i *DownloadFileInput) toDownloadObjectInput(w io.WriterAt) *DownloadObject
 }
 
 // DownloadFile downloads an object from S3 to a local file at input.FilePath,
-// splitting large objects into parts/ranges fetched in parallel (the same engine
-// as DownloadObject). It opens (creating/truncating) the destination file and
-// delegates to DownloadObject with that *os.File as the WriterAt. DownloadObject
-// writes to the file through its asynchronous write-behind queue.
-//
-// The returned DownloadObjectOutput carries the object metadata (the response Body
-// is replaced by the on-disk file). The caller still owns closing the file.
+// splitting it into byte ranges fetched in parallel. On Linux it uses O_DIRECT
+// when the destination filesystem supports it; other platforms and unsupported
+// Linux filesystems use buffered writes. The destination file is closed before
+// DownloadFile returns.
 func (c *Client) DownloadFile(ctx context.Context, input *DownloadFileInput, opts ...func(*Options)) (*DownloadObjectOutput, error) {
 	if input == nil || input.FilePath == "" {
 		return nil, fmt.Errorf("DownloadFile: FilePath is required")
 	}
 
-	f, err := os.OpenFile(input.FilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("DownloadFile: open destination %q: %w", input.FilePath, err)
-	}
-	defer f.Close()
-
 	options := c.options.Copy()
+	options.GetObjectType = types.GetObjectRanges
 	for _, opt := range opts {
 		opt(&options)
 	}
+	resolvePartSizeBytes(&options)
+	resolveWriteChunkSizeBytes(&options)
+	if err := validateDownloadFileOptions(options); err != nil {
+		return nil, fmt.Errorf("DownloadFile: %w", err)
+	}
 
-	d := downloader{in: input.toDownloadObjectInput(f), options: options}
+	f, writer, err := openDownloadFile(input.FilePath)
+	if err != nil {
+		return nil, fmt.Errorf("DownloadFile: open destination %q: %w", input.FilePath, err)
+	}
+
+	d := downloader{in: input.toDownloadObjectInput(writer), options: options}
 	out, err := d.download(ctx)
 	if err != nil {
-		return out, fmt.Errorf("DownloadFile: %w", err)
+		return out, fmt.Errorf("DownloadFile: %w", closeDownloadFile(f, err))
+	}
+
+	if err := f.Truncate(aws.ToInt64(out.ContentLength)); err != nil {
+		err = fmt.Errorf("truncate destination to %d bytes: %w", aws.ToInt64(out.ContentLength), err)
+		return out, fmt.Errorf("DownloadFile: %w", closeDownloadFile(f, err))
+	}
+	if err := f.Close(); err != nil {
+		return out, fmt.Errorf("DownloadFile: close destination: %w", err)
 	}
 	return out, nil
+}
+
+func validateDownloadFileOptions(o Options) error {
+	if o.GetObjectType != types.GetObjectRanges {
+		return fmt.Errorf("GetObjectType must be GetObjectRanges")
+	}
+	if o.PartSizeBytes <= 0 || o.PartSizeBytes%directIOAlignment != 0 {
+		return fmt.Errorf("PartSizeBytes must be a positive multiple of %d", directIOAlignment)
+	}
+	if o.WriteChunkSizeBytes <= 0 || o.WriteChunkSizeBytes%directIOAlignment != 0 {
+		return fmt.Errorf("WriteChunkSizeBytes must be a positive multiple of %d", directIOAlignment)
+	}
+	if o.WriteChunkSizeBytes > o.PartSizeBytes {
+		return fmt.Errorf("WriteChunkSizeBytes must be less than or equal to PartSizeBytes")
+	}
+	if o.PartSizeBytes%o.WriteChunkSizeBytes != 0 {
+		return fmt.Errorf("PartSizeBytes must be an integer multiple of WriteChunkSizeBytes")
+	}
+	return nil
+}
+
+func closeDownloadFile(f *os.File, prior error) error {
+	if err := f.Close(); err != nil {
+		return errors.Join(prior, fmt.Errorf("close destination: %w", err))
+	}
+	return prior
 }

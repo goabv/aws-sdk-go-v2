@@ -5,10 +5,19 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
+	"unsafe"
 )
 
-const writeBehindQueueDepth = 64
-const writeBehindWorkers = 64
+const (
+	writeBehindQueueDepth         = 64
+	writeBehindInitialWorkers     = 64
+	writeBehindWorkerBatch        = 16
+	writeBehindMaxWorkers         = 64
+	writeBehindScaleCheckInterval = 10 * time.Millisecond
+	writeBehindSaturationDuration = 100 * time.Millisecond
+	directIOAlignment             = 4096
+)
 
 type writeBehindJob struct {
 	buf  []byte
@@ -23,12 +32,29 @@ type writeBehindResult struct {
 	err error
 }
 
+type writeBufferAlignmentProvider interface {
+	writeBufferAlignment() int64
+}
+
+type writeBehindWorkerConfig struct {
+	queueDepth         int
+	initialWorkers     int
+	workerBatch        int
+	maxWorkers         int
+	scaleCheckInterval time.Duration
+	saturationDuration time.Duration
+}
+
 type writeBehindWriterAt struct {
-	w         io.WriterAt
-	chunkSize int64
-	pool      sync.Pool
-	queue     chan writeBehindJob
-	wg        sync.WaitGroup
+	w            io.WriterAt
+	chunkSize    int64
+	pool         sync.Pool
+	queue        chan writeBehindJob
+	workerConfig writeBehindWorkerConfig
+	wg           sync.WaitGroup
+	workerCount  atomic.Int64
+	scaleStop    chan struct{}
+	scaleDone    chan struct{}
 
 	closeMu sync.RWMutex
 	closed  bool
@@ -44,23 +70,105 @@ type writeBehindWriterAt struct {
 }
 
 func newWriteBehindWriterAt(w io.WriterAt, chunkSize int64) *writeBehindWriterAt {
+	return newWriteBehindWriterAtWithConfig(w, chunkSize, writeBehindWorkerConfig{
+		queueDepth:         writeBehindQueueDepth,
+		initialWorkers:     writeBehindInitialWorkers,
+		workerBatch:        writeBehindWorkerBatch,
+		maxWorkers:         writeBehindMaxWorkers,
+		scaleCheckInterval: writeBehindScaleCheckInterval,
+		saturationDuration: writeBehindSaturationDuration,
+	})
+}
+
+func newWriteBehindWriterAtWithConfig(w io.WriterAt, chunkSize int64, workerConfig writeBehindWorkerConfig) *writeBehindWriterAt {
 	if chunkSize <= 0 {
 		chunkSize = defaultWriteChunkSizeBytes
 	}
 
-	writer := &writeBehindWriterAt{
-		w:         w,
-		chunkSize: chunkSize,
-		queue:     make(chan writeBehindJob, writeBehindQueueDepth),
+	alignment := int64(1)
+	if provider, ok := w.(writeBufferAlignmentProvider); ok {
+		alignment = provider.writeBufferAlignment()
 	}
-	writer.pool.New = func() any { return make([]byte, chunkSize) }
+	writer := &writeBehindWriterAt{
+		w:            w,
+		chunkSize:    chunkSize,
+		queue:        make(chan writeBehindJob, workerConfig.queueDepth),
+		workerConfig: workerConfig,
+		scaleStop:    make(chan struct{}),
+		scaleDone:    make(chan struct{}),
+	}
+	writer.pool.New = func() any { return newWriteBuffer(chunkSize, alignment) }
 	writer.completeCond = sync.NewCond(&writer.completeMu)
 	writer.completed = map[uint64]struct{}{}
-	writer.wg.Add(writeBehindWorkers)
-	for i := 0; i < writeBehindWorkers; i++ {
-		go writer.writeWorker()
-	}
+	writer.startWorkers(workerConfig.initialWorkers)
+	go writer.scaleWorkers()
 	return writer
+}
+
+func (w *writeBehindWriterAt) startWorkers(count int) {
+	w.wg.Add(count)
+	w.workerCount.Add(int64(count))
+	for i := 0; i < count; i++ {
+		go w.writeWorker()
+	}
+}
+
+func (w *writeBehindWriterAt) scaleWorkers() {
+	defer close(w.scaleDone)
+
+	ticker := time.NewTicker(w.workerConfig.scaleCheckInterval)
+	defer ticker.Stop()
+
+	var saturatedSince time.Time
+	for {
+		select {
+		case <-w.scaleStop:
+			return
+		case now := <-ticker.C:
+			if len(w.queue) < cap(w.queue) {
+				saturatedSince = time.Time{}
+				continue
+			}
+			if saturatedSince.IsZero() {
+				saturatedSince = now
+				continue
+			}
+			if now.Sub(saturatedSince) < w.workerConfig.saturationDuration {
+				continue
+			}
+
+			w.growWorkers()
+			saturatedSince = now
+		}
+	}
+}
+
+func (w *writeBehindWriterAt) growWorkers() {
+	w.closeMu.RLock()
+	defer w.closeMu.RUnlock()
+	if w.closed {
+		return
+	}
+
+	count := min(w.workerConfig.workerBatch, w.workerConfig.maxWorkers-int(w.workerCount.Load()))
+	if count <= 0 {
+		return
+	}
+	w.startWorkers(count)
+}
+
+func newWriteBuffer(size, alignment int64) []byte {
+	if alignment <= 1 {
+		return make([]byte, size)
+	}
+
+	raw := make([]byte, size+alignment-1)
+	addr := uintptr(unsafe.Pointer(unsafe.SliceData(raw)))
+	skip := int64(0)
+	if remainder := addr % uintptr(alignment); remainder != 0 {
+		skip = alignment - int64(remainder)
+	}
+	return raw[skip : skip+size : skip+size]
 }
 
 func (w *writeBehindWriterAt) getBuffer() []byte {
@@ -91,6 +199,7 @@ func (w *writeBehindWriterAt) enqueue(buf []byte, n int64, off int64) (uint64, e
 
 func (w *writeBehindWriterAt) writeWorker() {
 	defer w.wg.Done()
+	defer w.workerCount.Add(-1)
 
 	for job := range w.queue {
 		w.doWrite(job)
@@ -145,6 +254,10 @@ func (w *writeBehindWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	return written, nil
 }
 
+func (w *writeBehindWriterAt) waitPending() error {
+	return w.waitThrough(w.nextSeq.Load())
+}
+
 func (w *writeBehindWriterAt) waitThrough(seq uint64) error {
 	w.completeMu.Lock()
 	for w.completedThrough < seq {
@@ -191,10 +304,12 @@ func (w *writeBehindWriterAt) drain() error {
 	w.closeMu.Lock()
 	if !w.closed {
 		w.closed = true
+		close(w.scaleStop)
 		close(w.queue)
 	}
 	w.closeMu.Unlock()
 
+	<-w.scaleDone
 	w.wg.Wait()
 	return w.err()
 }

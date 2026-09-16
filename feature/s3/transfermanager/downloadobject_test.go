@@ -906,3 +906,102 @@ func TestDownloadObjectWithContextCanceled(t *testing.T) {
 		})
 	}
 }
+
+type firstWriteBlockingWriterAt struct {
+	started chan struct{}
+	release <-chan struct{}
+	calls   atomic.Int64
+
+	mu   sync.Mutex
+	data []byte
+}
+
+func (w *firstWriteBlockingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	if w.calls.Add(1) == 1 {
+		close(w.started)
+		<-w.release
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	end := int(off) + len(p)
+	if end > len(w.data) {
+		w.data = append(w.data, make([]byte, end-len(w.data))...)
+	}
+	return copy(w.data[off:], p), nil
+}
+
+func (w *firstWriteBlockingWriterAt) bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return bytes.Clone(w.data)
+}
+
+func TestDownloadObjectShortRangeRetryWaitsForPendingWrite(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), directIOAlignment)
+	firstWriteStarted := make(chan struct{})
+	releaseFirstWrite := make(chan struct{})
+	retryStarted := make(chan struct{})
+	writer := &firstWriteBlockingWriterAt{
+		started: firstWriteStarted,
+		release: releaseFirstWrite,
+	}
+	attempts := atomic.Int64{}
+	client := &s3testing.TransferManagerLoggingClient{}
+	client.GetObjectFn = func(_ *s3testing.TransferManagerLoggingClient, in *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+		attempt := attempts.Add(1)
+		body := data
+		if attempt == 1 {
+			body = data[:127]
+		} else if attempt == 2 {
+			close(retryStarted)
+		}
+		return &s3.GetObjectOutput{
+			Body:          io.NopCloser(bytes.NewReader(body)),
+			ContentLength: aws.Int64(int64(len(data))),
+			ContentRange:  aws.String(fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data))),
+		}, nil
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := New(client, func(o *Options) {
+			o.GetObjectType = types.GetObjectRanges
+			o.PartSizeBytes = directIOAlignment
+			o.WriteChunkSizeBytes = directIOAlignment
+			o.Concurrency = 1
+		}).DownloadObject(context.Background(), &DownloadObjectInput{
+			Bucket:   aws.String("bucket"),
+			Key:      aws.String("key"),
+			WriterAt: writer,
+		})
+		result <- err
+	}()
+
+	select {
+	case <-firstWriteStarted:
+	case <-time.After(time.Second):
+		close(releaseFirstWrite)
+		t.Fatal("first write did not start")
+	}
+	select {
+	case <-retryStarted:
+		close(releaseFirstWrite)
+		<-result
+		t.Fatal("retry started before the failed attempt's write completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFirstWrite)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("DownloadObject: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DownloadObject did not finish after releasing the first write")
+	}
+	if got := writer.bytes(); !bytes.Equal(got, data) {
+		t.Fatal("retried range was overwritten by stale data")
+	}
+}

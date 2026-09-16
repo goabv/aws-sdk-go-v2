@@ -558,7 +558,8 @@ type downloader struct {
 	written    atomic.Int64
 	etag       string
 
-	writeBehind *writeBehindWriterAt
+	writeBehind    *writeBehindWriterAt
+	preallocateErr error
 
 	err error
 
@@ -823,13 +824,32 @@ func (d *downloader) tryDownloadChunk(ctx context.Context, params *s3.GetObjectI
 
 	d.totalBytesOnce.Do(func() {
 		d.setTotalBytes(out)
+		if preallocator, ok := d.in.WriterAt.(downloadFilePreallocator); ok && d.totalBytes > d.offset {
+			d.preallocateErr = preallocator.preallocate(d.totalBytes - d.offset)
+			if d.preallocateErr != nil {
+				return
+			}
+		}
 		d.emitter.Start(ctx, d.in, d.totalBytes-d.offset)
 	}) // Set total in first GET
+	if d.preallocateErr != nil {
+		_ = out.Body.Close()
+		return nil, fmt.Errorf("preallocating download file: %w", d.preallocateErr)
+	}
 
 	var n int64
 	defer out.Body.Close()
 	n, err = io.Copy(chunk, out.Body)
+	if err == nil && params.Range != nil && out.ContentLength != nil {
+		expected := aws.ToInt64(out.ContentLength)
+		if expected >= 0 && n != expected {
+			err = fmt.Errorf("%w: copied %d response body bytes, expected %d", io.ErrUnexpectedEOF, n, expected)
+		}
+	}
 	if err != nil {
+		if werr := d.writeBehind.waitPending(); werr != nil {
+			err = werr
+		}
 		return nil, &errReadingBody{err: err}
 	}
 

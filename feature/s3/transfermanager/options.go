@@ -73,7 +73,7 @@ type Options struct {
 
 	// WriteChunkSizeBytes is the fixed size in bytes of each async write-behind
 	// chunk issued to a DownloadObject/DownloadFile WriterAt. If zero,
-	// defaultWriteChunkSizeBytes (8 MiB) is used.
+	// defaultWriteChunkSizeBytes (32 MiB) is used.
 	WriteChunkSizeBytes int64
 
 	// Registry of single object progress listener hooks.

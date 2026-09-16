@@ -22,7 +22,7 @@ const defaultGetBufferSize = 1024 * 1024 * 50
 
 // defaultWriteChunkSizeBytes is the default chunk size used by DownloadObject's
 // async write-behind queue.
-const defaultWriteChunkSizeBytes = 1024 * 1024 * 8
+const defaultWriteChunkSizeBytes = 1024 * 1024 * 32
 
 // Client provides the API client to make operations call for Amazon Simple
 // Storage Service's Transfer Manager
